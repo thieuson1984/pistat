@@ -24,6 +24,8 @@ ACTION="install"
 NO_RUN=0
 [ "${PISTAT_NO_RUN:-0}" = "1" ] && NO_RUN=1
 MIN_TEXTUAL="0.47"
+# marker printed above the PATH line this installer adds to shell startup files
+PATH_MARK="# pistat installer: puts pistat on PATH"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
   B=$'\033[1m'; D=$'\033[2m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; N=$'\033[0m'
@@ -89,6 +91,12 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# a relative --prefix would make the launcher depend on the caller's cwd
+case "$PREFIX" in
+  /*) : ;;
+  *)  PREFIX="$(pwd)/${PREFIX#./}" ;;
+esac
+
 APP_DIR="$PREFIX/lib/pistat"
 BIN_DIR="$PREFIX/bin"
 LAUNCHER="$BIN_DIR/pistat"
@@ -102,6 +110,17 @@ fi
 if [ "$ACTION" = "uninstall" ]; then
   if [ -e "$LAUNCHER" ]; then $SUDO rm -f "$LAUNCHER"; ok "removed $LAUNCHER"; else info "no launcher at $LAUNCHER"; fi
   if [ -d "$APP_DIR" ]; then $SUDO rm -rf "$APP_DIR"; ok "removed $APP_DIR"; else info "no files at $APP_DIR"; fi
+  # take back the PATH line the installer added (marker line + the export below it)
+  for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc" "$HOME/.profile"; do
+    [ -f "$rc" ] || continue
+    grep -qF "$PATH_MARK" "$rc" 2>/dev/null || continue
+    sed -i "/$PATH_MARK/,+1d" "$rc" 2>/dev/null \
+      && ok "cleaned PATH line from $rc"
+  done
+  if [ -f "$HOME/.config/fish/conf.d/pistat.fish" ]; then
+    rm -f "$HOME/.config/fish/conf.d/pistat.fish" && ok "removed the fish PATH entry"
+  fi
+  info "preferences kept: ${XDG_CONFIG_HOME:-$HOME/.config}/pistat/config.json"
   say ""
   ok "pistat uninstalled"
   exit 0
@@ -242,9 +261,60 @@ EOF
 $SUDO chmod 0755 "$LAUNCHER"
 ok "launcher $LAUNCHER"
 
+# ---------------------------------------------------------- shell integration ---
+ensure_path() {
+  # `pistat` must work from any directory. The launcher itself is absolute, so
+  # the only thing missing on a fresh machine is $BIN_DIR on PATH: add it to the
+  # startup file of every shell we can find, exactly once.
+  case ":$PATH:" in
+    *":$BIN_DIR:"*)
+      ok "path     $BIN_DIR already on \$PATH"
+      return 0 ;;
+  esac
+  if [ "$MODE" = "system" ]; then
+    warn "$BIN_DIR is not on \$PATH — add it to /etc/profile by hand"
+    return 0
+  fi
+
+  added=""
+  for rc in "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zshrc" "$HOME/.profile"; do
+    [ -f "$rc" ] || continue
+    grep -qF "$PATH_MARK" "$rc" 2>/dev/null && continue
+    if printf '\n%s\nexport PATH="%s:$PATH"\n' "$PATH_MARK" "$BIN_DIR" >>"$rc" 2>/dev/null; then
+      added="$added $(basename "$rc")"
+    fi
+  done
+  if [ -z "$added" ]; then          # no startup file matched: create ~/.profile
+    if printf '%s\nexport PATH="%s:$PATH"\n' "$PATH_MARK" "$BIN_DIR" >>"$HOME/.profile" 2>/dev/null; then
+      added=" .profile"
+    fi
+  fi
+  # fish does not read any of the above
+  if [ -d "$HOME/.config/fish" ]; then
+    fish_conf="$HOME/.config/fish/conf.d/pistat.fish"
+    if [ ! -f "$fish_conf" ] || ! grep -qF "$PATH_MARK" "$fish_conf" 2>/dev/null; then
+      mkdir -p "$(dirname "$fish_conf")" 2>/dev/null || true
+      if printf '%s\nset -gx PATH "%s" $PATH\n' "$PATH_MARK" "$BIN_DIR" >>"$fish_conf" 2>/dev/null; then
+        added="$added fish"
+      fi
+    fi
+  fi
+
+  if [ -n "$added" ]; then
+    ok "path     added $BIN_DIR to:$added"
+    info "         'pistat' works from any directory in a new shell (this one: exec \$SHELL -l)"
+  else
+    warn "could not edit your shell startup files — add this line yourself:"
+    say "  export PATH=\"$BIN_DIR:\$PATH\""
+  fi
+}
+
 # ------------------------------------------------------------------- verify ---
 VER="$("$LAUNCHER" --version 2>&1)" || die "launcher does not run: $VER"
 ok "verify   $VER"
+( cd / && "$LAUNCHER" --version >/dev/null 2>&1 ) \
+  || die "launcher only works from its own directory — the paths are wrong"
+ok "verify   runs from any directory"
 if ! "$LAUNCHER" --json -i 0.2 >"$TMP/snap.json" 2>"$TMP/snap.err"; then
   sed 's/^/    /' "$TMP/snap.err" >&2 || true
   die "snapshot test failed — run '$LAUNCHER --once' to see why"
@@ -255,16 +325,14 @@ ok "verify   live snapshot ($("$RUN_PY" -c 'import json,sys;print(json.load(open
 
 # ------------------------------------------------------------------ epilogue ---
 say ""
-case ":$PATH:" in
-  *":$BIN_DIR:"*) : ;;
-  *) warn "$BIN_DIR is not on your PATH — add it:"
-     say "  echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.profile" ;;
-esac
+ensure_path
 say "${B}Installed${N} — $LAUNCHER"
 say "  pistat               interactive TUI (q to quit)"
 say "  pistat --once        one plain-text snapshot"
 say "  pistat --json -i 0.5 machine-readable, good for cron/monitoring"
+say "  pistat --themes      list themes (^p → Change theme in the TUI)"
 say "  pistat --help        every flag and key"
+say "${D}Your theme is remembered in \$XDG_CONFIG_HOME/pistat/config.json${N}"
 say "${D}Remove it with: bash install.sh --uninstall${PREFIX:+ --prefix $PREFIX}${N}"
 
 # --------------------------------------------------------------- start it up ---

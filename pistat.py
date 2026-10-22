@@ -9,6 +9,8 @@ rolling sparklines, and a sortable process table with state statistics.
   pistat.py               interactive TUI
   pistat.py --once        one plain-text snapshot, then exit
   pistat.py -i 0.5        sampling interval in seconds (default 1.0)
+  pistat.py --themes      list theme names (* = the remembered one)
+  pistat.py --theme nord  start in nord and remember it for next time
 
 Keys: q quit · p pause · s cycle sort · S reverse · 1/2/5 interval · r reset
       peaks · / filter · j/k or arrows move · PgUp/PgDn · Home/End
@@ -39,10 +41,10 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.theme import Theme
+from textual.theme import BUILTIN_THEMES, Theme
 from textual.widgets import Footer, Header, Input, Static
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 MIN_INTERVAL = 0.1          # below this a 1 s timer would busy-loop the CPU
 DEFAULT_WIDTH = 100         # --once fallback width when stdout is a pipe
@@ -81,6 +83,50 @@ C_HOT = PALETTE["hot"]
 C_BAD = PALETTE["bad"]
 C_MAGENTA = PALETTE["magenta"]
 C_TRACK = PALETTE["track"]
+
+# --------------------------------------------------------------------------- #
+# persisted preferences — the theme you pick is remembered for the next run
+# --------------------------------------------------------------------------- #
+DEFAULT_THEME = "pistat"
+
+
+def config_path() -> Path:
+    """Where preferences live: $PISTAT_CONFIG_DIR, else XDG_CONFIG_HOME/pistat."""
+    base = os.environ.get("PISTAT_CONFIG_DIR")
+    if base:
+        return Path(base).expanduser() / "config.json"
+    root = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(root).expanduser() / "pistat" / "config.json"
+
+
+def load_config() -> dict:
+    """Read the preference file; a missing or broken file is simply empty."""
+    try:
+        data = json.loads(config_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_config(**values) -> bool:
+    """Merge `values` into the preference file atomically. Never raises.
+
+    Returns False when the file could not be written (read-only $HOME, full
+    disk); the dashboard must keep working in that case, so failures are silent.
+    """
+    data = load_config()
+    data.update(values)
+    path = config_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n",
+                       encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        return False
+    return True
+
 
 # The app's own theme: the slate palette above, registered so the command
 # palette ("Change theme") can switch away from it and back.
@@ -1383,7 +1429,7 @@ class PistatApp(App):
         (1, 1): ("#p_cpu",),
     }
 
-    def __init__(self, interval: float = 1.0):
+    def __init__(self, interval: float = 1.0, theme: str | None = None):
         super().__init__()
         self.interval = interval
         self.collector = Collector()
@@ -1401,7 +1447,25 @@ class PistatApp(App):
         self._view_h = 10
         # our slate theme, and let the command palette switch to any other
         self.register_theme(PISTAT_THEME)
-        self.theme = "pistat"
+        self.theme = self._initial_theme(theme)
+
+    def _initial_theme(self, requested: str | None) -> str:
+        """Pick the startup theme: explicit flag > saved preference > slate.
+
+        The choice is written back to the config file, so `--theme` also
+        updates the default for later runs and a stale/removed theme name in
+        the file gets cleaned up instead of being retried every start.
+        """
+        available = self.available_themes
+        saved = load_config().get("theme")
+        for candidate, remember in ((requested, True), (saved, False)):
+            if isinstance(candidate, str) and candidate in available:
+                if remember:
+                    save_config(theme=candidate)
+                return candidate
+        if saved is not None:
+            save_config(theme=DEFAULT_THEME)
+        return DEFAULT_THEME
 
     # -- layout ----------------------------------------------------------- #
     def compose(self) -> ComposeResult:
@@ -1440,6 +1504,7 @@ class PistatApp(App):
             apply_palette(palette_from_theme(self.get_theme(theme_name)))
         except Exception:                 # noqa: BLE001 — never break a theme switch
             return
+        save_config(theme=theme_name)     # remember it for the next run
         self._panel_cache.clear()
         if self.last is not None and self.is_mounted:
             self.render_all(self.last)
@@ -1896,8 +1961,24 @@ def main(argv: list[str] | None = None) -> int:
                     help="print one snapshot as JSON and exit (implies --once)")
     ap.add_argument("-w", "--width", type=int, default=None,
                     help="output width for --once/--json (default: terminal width)")
+    ap.add_argument("-t", "--theme", metavar="NAME", default=None,
+                    help="start with this theme and remember it (see --themes; "
+                         "in the TUI: ^p → Change theme)")
+    ap.add_argument("--themes", action="store_true",
+                    help="list the available theme names and exit")
     ap.add_argument("-V", "--version", action="version", version=f"pistat {__version__}")
     args = ap.parse_args(argv)
+
+    known_themes = ["pistat", *sorted(BUILTIN_THEMES)]
+    if args.themes:
+        saved = load_config().get("theme") or DEFAULT_THEME
+        for name in known_themes:
+            print(f"{'*' if name == saved else ' '} {name}")
+        print(f"\n(* = remembered; choose with pistat --theme NAME or ^p in the TUI)")
+        return 0
+    if args.theme is not None and not args.once and not args.json:
+        if args.theme not in known_themes:
+            ap.error(f"unknown theme {args.theme!r} — run 'pistat --themes' for the list")
 
     interval = max(MIN_INTERVAL, args.interval)
     if interval != args.interval:
@@ -1907,7 +1988,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.once or args.json:
             once(interval, term_width(args.width), as_json=args.json)
         else:
-            PistatApp(interval=interval).run()
+            PistatApp(interval=interval, theme=args.theme).run()
     except KeyboardInterrupt:
         return 130
     return 0

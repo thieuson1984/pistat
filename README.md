@@ -2,8 +2,8 @@
 
 A single-file Textual/Rich dashboard for a Raspberry Pi (developed on a Pi 4
 Model B, Debian 13, aarch64). Reads `/proc`, `/sys/class/thermal`,
-`/sys/class/hwmon` and `vcgencmd` directly — no daemon, no config file, no
-network, no writes.
+`/sys/class/hwmon` and `vcgencmd` directly — no daemon, no network, no root.
+The only thing it ever writes is its own preference file (the theme you pick).
 
 ```
 pistat                  # interactive TUI, 1 s refresh
@@ -11,6 +11,8 @@ pistat -i 2             # lighter: 2 s refresh
 pistat --once           # one plain-text snapshot, then exit (SSH one-liners)
 pistat --once -w 72     # same, forced to 72 columns
 pistat --json           # one snapshot as JSON (cron, Prometheus textfile, jq)
+pistat --themes         # list themes, * marks the remembered one
+pistat --theme nord     # start in nord and remember it
 pistat --version
 ```
 
@@ -25,11 +27,15 @@ curl -fsSL https://raw.githubusercontent.com/thieuson1984/pistat/main/install.sh
 It drops the app in `~/.local/lib/pistat`, the launcher in `~/.local/bin/pistat`,
 and installs `textual`/`rich`/`psutil` only if the system Python cannot already
 import a new enough `textual` — otherwise it builds a private venv, so it is
-PEP 668-safe on Debian/Ubuntu. It finishes by running `pistat --version` and a
-live `--json` snapshot, so a broken install fails loudly instead of later — and
-then **starts pistat for you**, because installing and running should be one
-command, not two. Pass `--no-run` (or `PISTAT_NO_RUN=1`) when you install from a
-script, and it exits quietly after the summary.
+PEP 668-safe on Debian/Ubuntu. The launcher holds absolute paths and puts
+`~/.local/bin` on your `PATH` (appended once to `~/.bashrc` / `~/.zshrc` /
+`~/.profile`, plus a fish `conf.d` entry), so after a new shell `pistat` works
+from any directory — no `cd` into the checkout, no `./pistat.py`. It finishes by
+running `pistat --version` and a live `--json` snapshot (and proves the launcher
+works from `/`), so a broken install fails loudly instead of later — and then
+**starts pistat for you**, because installing and running should be one command,
+not two. Pass `--no-run` (or `PISTAT_NO_RUN=1`) when you install from a script,
+and it exits quietly after the summary.
 
 ```sh
 # variants (from the checkout, or: curl … | bash -s -- --system)
@@ -120,7 +126,7 @@ whole window.
 ```json
 {
   "host": "pi.kapp.vn", "board": "Raspberry Pi 4 Model B Rev 1.2",
-  "pistat": "1.1.0", "time": "2026-10-23T00:45:32+0700", "uptime_s": 4821.1,
+  "pistat": "1.2.1", "time": "2026-10-23T00:45:32+0700", "uptime_s": 4821.1,
   "cpu":    {"total_pct": 11.6, "per_core_pct": [2.9, 6.1, 28.6, 8.8],
              "per_core_mhz": [1800, 1800, 1800, 1800], "load": [1.41, 1.06, 0.68],
              "governor": "ondemand", "peak_pct": 25.0},
@@ -153,9 +159,15 @@ consumer never has to guess. Example cron entry:
 The chrome is drawn with Textual theme variables (`$background`, `$panel`,
 `$primary`, …) and the hand-drawn panels derive their colours from the active
 theme, so **`^p` → Change theme** recolours everything — including the bars and
-sparklines — and the choice survives for the session. `pistat` is registered as
-the default theme; the 20-odd built-ins (nord, gruvbox, catppuccin, solarized,
-dracula, tokyo-night, ansi-light …) are all selectable.
+sparklines. The choice is written to `$XDG_CONFIG_HOME/pistat/config.json`
+(`~/.config/pistat/config.json` by default) and restored on the next run, so it
+never has to be re-picked. `pistat --theme NAME` sets and remembers a theme
+without opening the palette, `pistat --themes` lists them, and `pistat` is
+registered as the default theme; the 20-odd built-ins (nord, gruvbox,
+catppuccin, solarized, dracula, tokyo-night, ansi-light …) are all selectable.
+A theme name that disappears (or a corrupt config file) falls back to the
+default instead of breaking startup; `PISTAT_CONFIG_DIR` relocates the file,
+which is how the tests keep your real preference untouched.
 
 Two details worth knowing: the `text-*` theme variables are used because they
 are contrast-corrected for text on the theme background, and any 8-digit
@@ -195,7 +207,8 @@ slate palette.
 - Measured on this Pi 4 at 120 × 44: **≈11 % of one core (≈3 % of the whole
   machine)** at the 1 s default, ≈8 % at `-i 2`. For comparison `htop` runs at
   ≈2 % of a core.
-- No writes: everything is read-only except the terminal.
+- No writes: everything is read-only except the terminal and the theme
+  preference file.
 
 ## Tests
 
@@ -205,8 +218,8 @@ failure. Run them from anywhere:
 ```sh
 python3 tests/test_layout.py     # every terminal size: list visible, nothing clipped
 python3 tests/test_keys.py       # bindings, sort cycle, filter, navigation
-python3 tests/test_features.py   # theme switching, header sorting, kill (SIGTERM/SIGKILL)
-python3 tests/test_cli.py        # --version/--json/--once/-w, interval clamp, no ANSI in a pipe
+python3 tests/test_features.py   # theme switching + persistence, header sorting, kill
+python3 tests/test_cli.py        # --version/--json/--once/-w/--themes, interval clamp, no ANSI in a pipe
 python3 tests/test_headless.py   # full app render → screenshot.svg
 python3 tests/probe.py           # sizes/regions/classes at one or many sizes
 python3 tests/pty_capture.py 100 30 3   # real PTY screen dump (needs pyte)
@@ -225,7 +238,7 @@ screenshot.svg     last headless render (Textual SVG export)
 tests/             development harnesses and regression suites
   test_layout.py     responsive layout + clipping regression
   test_keys.py       key bindings / filter / navigation
-  test_features.py   theme switching, header sorting, kill signals
+  test_features.py   theme switching + persistence, header sorting, kill signals
   test_cli.py        CLI contract (flags, JSON, width, clamping)
   test_headless.py   headless render, writes screenshot.svg
   probe.py           layout probe (sizes, regions, classes)

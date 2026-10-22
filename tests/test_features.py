@@ -4,12 +4,17 @@ Every check drives the real app through Textual's test harness; the kill test
 uses a throwaway `sleep` child so nothing important can be signalled.
 """
 import asyncio
+import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+# keep the developer's real ~/.config/pistat out of the tests
+os.environ["PISTAT_CONFIG_DIR"] = tempfile.mkdtemp(prefix="pistat-test-cfg-")
 
 import pistat
 from pistat import Confirm, PistatApp
@@ -40,6 +45,47 @@ async def test_theme_switch() -> None:
         app.theme = "pistat"
         await asyncio.sleep(0.5)
         assert (pistat.C_TITLE, pistat.C_LABEL) == slate, "did not restore the slate palette"
+
+
+async def test_theme_persist() -> None:
+    """A theme chosen in one run comes back in the next (XDG config file)."""
+    cfg = pistat.config_path()
+    cfg.unlink(missing_ok=True)
+
+    app = PistatApp(interval=0.3)
+    async with app.run_test(size=(120, 44)):
+        await asyncio.sleep(0.6)
+        assert app.theme == "pistat", app.theme
+        app.theme = "gruvbox"
+        await asyncio.sleep(0.6)
+        assert json.loads(cfg.read_text())["theme"] == "gruvbox", cfg.read_text()
+
+    # a fresh app instance — as in a new `pistat` run — starts in gruvbox
+    again = PistatApp(interval=0.3)
+    async with again.run_test(size=(120, 44)):
+        await asyncio.sleep(0.8)
+        assert again.theme == "gruvbox", again.theme
+        title = pistat.palette_from_theme(again.get_theme("gruvbox"))["title"]
+        assert pistat.C_TITLE == f"bold {title}", (pistat.C_TITLE, title)
+
+    # an explicit --theme wins and becomes the remembered default
+    flagged = PistatApp(interval=0.3, theme="tokyo-night")
+    async with flagged.run_test(size=(120, 44)):
+        await asyncio.sleep(0.6)
+        assert flagged.theme == "tokyo-night", flagged.theme
+    assert json.loads(cfg.read_text())["theme"] == "tokyo-night"
+
+    # a theme that no longer exists must not brick startup: fall back and clean up
+    cfg.write_text(json.dumps({"theme": "no-such-theme"}))
+    fallback = PistatApp(interval=0.3)
+    async with fallback.run_test(size=(120, 44)):
+        await asyncio.sleep(0.6)
+        assert fallback.theme == "pistat", fallback.theme
+    assert json.loads(cfg.read_text())["theme"] == "pistat", cfg.read_text()
+
+    # a corrupt config file is treated as empty, not fatal
+    cfg.write_text("{not json")
+    assert PistatApp(interval=0.3).theme == "pistat"
 
 
 async def test_sort() -> None:
@@ -162,10 +208,10 @@ async def test_kill() -> None:
 
 
 async def main() -> None:
-    for fn in (test_theme_switch, test_sort, test_kill):
+    for fn in (test_theme_switch, test_theme_persist, test_sort, test_kill):
         await fn()
         print("ok", fn.__name__)
-    print("3 feature checks passed")
+    print("4 feature checks passed")
 
 
 if __name__ == "__main__":

@@ -3,11 +3,16 @@
 Exits non-zero on the first failed assertion, so it doubles as a smoke test.
 """
 import asyncio
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+# never read/write the developer's real ~/.config/pistat from a test run
+os.environ["PISTAT_CONFIG_DIR"] = tempfile.mkdtemp(prefix="pistat-test-cfg-")
 
 from pistat import PistatApp
 

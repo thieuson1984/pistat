@@ -3,11 +3,15 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "pistat.py"
 sys.path.insert(0, str(ROOT))
+
+# never read/write the developer's real ~/.config/pistat from a test run
+os.environ["PISTAT_CONFIG_DIR"] = tempfile.mkdtemp(prefix="pistat-test-cfg-")
 
 import pistat
 
@@ -27,8 +31,24 @@ def test_version() -> None:
 def test_help() -> None:
     out = run("--help")
     assert out.returncode == 0
-    for flag in ("--once", "--json", "--interval", "--width", "--version"):
+    for flag in ("--once", "--json", "--interval", "--width", "--version",
+                 "--theme", "--themes"):
         assert flag in out.stdout, f"{flag} missing from --help"
+
+
+def test_themes_listing() -> None:
+    out = run("--themes")
+    assert out.returncode == 0, out.stderr
+    names = [line.lstrip("* ").strip() for line in out.stdout.splitlines() if line.strip()]
+    for name in ("pistat", "nord", "gruvbox", "solarized-light"):
+        assert name in names, f"{name} missing from --themes"
+    assert any(line.startswith("*") for line in out.stdout.splitlines()), out.stdout
+
+
+def test_unknown_theme_rejected() -> None:
+    out = run("--theme", "definitely-not-a-theme")
+    assert out.returncode == 2, out.returncode
+    assert "unknown theme" in out.stderr.lower(), out.stderr
 
 
 def test_json() -> None:
