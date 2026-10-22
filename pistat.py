@@ -22,22 +22,27 @@ import json
 import os
 import pwd
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import time
 from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from typing import ClassVar
 
 import psutil
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
+from textual.screen import ModalScreen
+from textual.theme import Theme
 from textual.widgets import Footer, Header, Input, Static
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 MIN_INTERVAL = 0.1          # below this a 1 s timer would busy-loop the CPU
 DEFAULT_WIDTH = 100         # --once fallback width when stdout is a pipe
@@ -47,17 +52,137 @@ BAR_FULL = "█"
 BAR_EMPTY = "░"
 SPARK = "▁▂▃▄▅▆▇█"
 
-C_TITLE = "bold #7dd3fc"
-C_LABEL = "#94a3b8"
-C_DIM = "#64748b"
-C_VAL = "#e2e8f0"
-C_ACCENT = "#38bdf8"
-C_OK = "#4ade80"
-C_WARN = "#facc15"
-C_HOT = "#fb923c"
-C_BAD = "#f87171"
-C_MAGENTA = "#e879f9"
-C_TRACK = "#334155"
+# --------------------------------------------------------------------------- #
+# palette — every colour the panels draw with, derived from the active theme
+# --------------------------------------------------------------------------- #
+# Defaults are the slate look; --once uses them directly (no Textual app there).
+PALETTE: dict[str, str] = {
+    "title": "#7dd3fc",
+    "label": "#94a3b8",
+    "dim": "#64748b",
+    "value": "#e2e8f0",
+    "accent": "#38bdf8",
+    "ok": "#4ade80",
+    "warn": "#facc15",
+    "hot": "#fb923c",
+    "bad": "#f87171",
+    "magenta": "#e879f9",
+    "track": "#334155",
+}
+
+C_TITLE = f"bold {PALETTE['title']}"
+C_LABEL = PALETTE["label"]
+C_DIM = PALETTE["dim"]
+C_VAL = PALETTE["value"]
+C_ACCENT = PALETTE["accent"]
+C_OK = PALETTE["ok"]
+C_WARN = PALETTE["warn"]
+C_HOT = PALETTE["hot"]
+C_BAD = PALETTE["bad"]
+C_MAGENTA = PALETTE["magenta"]
+C_TRACK = PALETTE["track"]
+
+# The app's own theme: the slate palette above, registered so the command
+# palette ("Change theme") can switch away from it and back.
+PISTAT_THEME = Theme(
+    name="pistat",
+    primary="#38bdf8",
+    secondary="#22d3ee",
+    accent="#e879f9",
+    success="#4ade80",
+    warning="#facc15",
+    error="#f87171",
+    foreground="#e2e8f0",
+    background="#0b1220",
+    surface="#0e1626",
+    panel="#111c33",
+    dark=True,
+)
+
+
+def apply_palette(p: dict[str, str]) -> None:
+    """Point every module-level colour at `p` (called whenever the theme changes)."""
+    global C_TITLE, C_LABEL, C_DIM, C_VAL, C_ACCENT, C_OK, C_WARN, C_HOT, C_BAD
+    global C_MAGENTA, C_TRACK
+    PALETTE.update(p)
+    C_TITLE = f"bold {p['title']}"
+    C_LABEL = p["label"]
+    C_DIM = p["dim"]
+    C_VAL = p["value"]
+    C_ACCENT = p["accent"]
+    C_OK = p["ok"]
+    C_WARN = p["warn"]
+    C_HOT = p["hot"]
+    C_BAD = p["bad"]
+    C_MAGENTA = p["magenta"]
+    C_TRACK = p["track"]
+
+
+def _rgb(color: str) -> tuple[int, int, int] | None:
+    h = color.lstrip("#")
+    if len(h) == 3:
+        h = "".join(c * 2 for c in h)
+    if len(h) not in (6, 8):
+        return None
+    try:
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore[return-value]
+    except ValueError:
+        return None
+
+
+def _solid(color: str, base: tuple[int, int, int]) -> str | None:
+    """Flatten '#RRGGBBAA' onto `base`; Rich cannot parse 8-digit hex."""
+    h = color.lstrip("#")
+    if len(h) in (3, 6):
+        return f"#{h}"
+    rgb = _rgb(color)
+    if rgb is None or len(h) != 8:
+        return None
+    try:
+        alpha = int(h[6:8], 16) / 255.0
+    except ValueError:
+        return None
+    blended = (round(alpha * c + (1.0 - alpha) * b) for c, b in zip(rgb, base))
+    return "#" + "".join(f"{c:02X}" for c in blended)
+
+
+def palette_from_theme(theme: Theme) -> dict[str, str]:
+    """Map a Textual theme onto the colour roles the panels use.
+
+    The `text-*` variables are Textual's contrast-corrected variants, which is
+    what you want for coloured text sitting on the theme background. Several of
+    them carry an alpha channel, so they are flattened onto the theme surface
+    first — Rich only understands #RGB and #RRGGBB.
+    """
+    gen = theme.to_color_system().generate()
+    base = (_rgb(gen.get("surface") or "") or _rgb(gen.get("background") or "")
+            or (14, 22, 38))
+
+    def pick(*names: str, default: str) -> str:
+        for name in names:
+            value = gen.get(name)
+            if not value or value in ("transparent", "initial") or " " in value:
+                continue
+            solid = _solid(value, base)
+            if solid:
+                return solid
+        return default
+
+    return {
+        "title": pick("text-primary", "primary", default=PALETTE["title"]),
+        "label": pick("foreground-muted", "foreground", default=PALETTE["label"]),
+        "dim": pick("foreground-disabled", "foreground-muted", "foreground",
+                    default=PALETTE["dim"]),
+        "value": pick("foreground", default=PALETTE["value"]),
+        "accent": pick("text-primary", "primary", default=PALETTE["accent"]),
+        "ok": pick("text-success", "success", default=PALETTE["ok"]),
+        "warn": pick("text-warning", "warning", default=PALETTE["warn"]),
+        "hot": pick("warning", "text-warning", default=PALETTE["hot"]),
+        "bad": pick("text-error", "error", default=PALETTE["bad"]),
+        "magenta": pick("text-accent", "accent", default=PALETTE["magenta"]),
+        "track": pick("surface-lighten-2", "panel-lighten-2", default=PALETTE["track"]),
+    }
+
 
 MOUNT_ALIAS = {
     "/": "/",
@@ -141,19 +266,21 @@ def usage_style(pct: float) -> str:
     return C_OK
 
 
-def bar(pct: float, width: int, color: str = C_ACCENT) -> Text:
+def bar(pct: float, width: int, color: str | None = None) -> Text:
     pct = max(0.0, min(100.0, float(pct)))
     width = max(1, width)
     filled = round(width * pct / 100.0)
+    color = color or C_ACCENT        # resolved per call: the palette can change
     t = Text()
     t.append(BAR_FULL * filled, style=color)
     t.append(BAR_EMPTY * (width - filled), style=C_TRACK)
     return t
 
 
-def sparkline(values, width: int, color: str = C_ACCENT) -> Text:
+def sparkline(values, width: int, color: str | None = None) -> Text:
     """Fixed-width block sparkline, scaled to its own peak."""
     width = max(0, width)
+    color = color or C_ACCENT
     t = Text()
     vals = list(values)[-width:] if width else []
     pad = width - len(vals)
@@ -193,13 +320,13 @@ def pad(text: Text, width: int) -> Text:
     return text
 
 
-def kv(label: str, value, style: str = C_VAL, width: int = 8, pad: int = 0) -> Text:
+def kv(label: str, value, style: str | None = None, width: int = 8, pad: int = 0) -> Text:
     t = Text()
     t.append(f"{label:<{width}}", style=C_LABEL)
     if isinstance(value, Text):
         t.append_text(value)
     else:
-        t.append(f"{value!s:<{pad}}" if pad else str(value), style=style)
+        t.append(f"{value!s:<{pad}}" if pad else str(value), style=style or C_VAL)
     return t
 
 
@@ -988,6 +1115,35 @@ PROC_ORDER = ("pid", "user", "ni", "cpu", "mem", "rss", "thr", "state", "time")
 PROC_DROP = ("ni", "thr", "time", "user", "state", "mem", "rss")
 MIN_CMD = 12
 
+# table column -> sort key (COMMAND sorts by process name)
+COL_SORT: dict[str, str] = {
+    "pid": "pid",
+    "user": "user",
+    "ni": "nice",
+    "cpu": "cpu",
+    "mem": "mem",
+    "rss": "rss",
+    "thr": "threads",
+    "state": "state",
+    "time": "cputime",
+}
+
+# sort key -> extraction function
+SORT_KEYS: dict[str, Callable[[dict], tuple]] = {
+    "cpu": lambda r: (r["cpu"], r["mem"]),
+    "mem": lambda r: (r["rss"],),
+    "rss": lambda r: (r["rss"],),
+    "pid": lambda r: (r["pid"],),
+    "name": lambda r: (r["name"].lower(), r["pid"]),
+    "user": lambda r: (r["user"].lower(), r["pid"]),
+    "cputime": lambda r: (r["cputime"],),
+    "threads": lambda r: (r["threads"], r["pid"]),
+    "state": lambda r: (r["state"], r["pid"]),
+    "nice": lambda r: (r["nice"], r["pid"]),
+}
+# text-ish keys read better ascending the first time you click them
+SORT_ASC = frozenset({"name", "user", "state"})
+
 
 def pick_cols(width: int) -> tuple[list[str], int]:
     """Which columns fit in `width` cells, and how wide COMMAND can be."""
@@ -1004,12 +1160,21 @@ def pick_cols(width: int) -> tuple[list[str], int]:
     return cols, max(6, width - used(cols))
 
 
-def proc_header(cols: list[str], cmd_w: int) -> Text:
+def proc_header(cols: list[str], cmd_w: int, sort_key: str | None = None,
+                reverse: bool = True) -> Text:
+    """Header row; the active sort column carries an arrow and a highlight."""
+    arrow = "↓" if reverse else "↑"
     t = Text(style=C_TITLE)
     for c in cols:
         head, w, al = PROC_COLS[c]
-        t.append(f"{head:{al}{w}} ")
-    t.append(f"{'COMMAND':<{cmd_w}}")
+        active = sort_key is not None and COL_SORT.get(c) == sort_key
+        label = f"{arrow}{head}" if active else head
+        t.append(f"{label:{al}{w}} ",
+                 style=f"bold underline {C_ACCENT}" if active else C_TITLE)
+    if sort_key == "name":
+        t.append(f"{arrow}COMMAND".ljust(cmd_w)[:cmd_w], style=f"bold underline {C_ACCENT}")
+    else:
+        t.append(f"{'COMMAND':<{cmd_w}}")
     return t
 
 
@@ -1033,12 +1198,14 @@ def proc_row(r: dict, cols: list[str], cmd_w: int, command: str,
         "state": (r["state"], sstyle),
         "time": (fmt_cpu_time(r["cputime"]), C_DIM),
     }
-    line = Text(style="on #1d4ed8" if selected else "")
+    # reverse video for the cursor line: readable on every theme, no colour maths
+    base = "reverse bold" if selected else ""
+    line = Text(style=base)
     for c in cols:
         _head, w, al = PROC_COLS[c]
         text, style = cells[c]
-        line.append(f"{text[:w]:{al}{w}} ", style=style)
-    line.append(command[:cmd_w], style=C_VAL)
+        line.append(f"{text[:w]:{al}{w}} ", style=f"{style} {base}" if base else style)
+    line.append(command[:cmd_w], style=f"{C_VAL} {base}" if base else C_VAL)
     return line
 
 
@@ -1046,11 +1213,11 @@ def proc_row(r: dict, cols: list[str], cmd_w: int, command: str,
 # Textual UI
 # --------------------------------------------------------------------------- #
 CSS = """
-Screen { background: #0b1220; }
-Header { background: #111c33; color: #7dd3fc; }
-Footer { background: #111c33; }
-Footer > .footer--key { background: #1e293b; color: #7dd3fc; text-style: bold; }
-Footer > .footer--description { color: #94a3b8; }
+Screen { background: $background; }
+Header { background: $panel; color: $text-primary; }
+Footer { background: $panel; }
+Footer > .footer--key { background: $boost; color: $text-primary; text-style: bold; }
+Footer > .footer--description { color: $foreground-muted; }
 #body { height: 1fr; padding: 0 1; }
 #top { layout: grid; grid-gutter: 0 1; height: 18; overflow: hidden; }
 /* g<cols><bands> — every band is 9 rows tall, so the grid always matches its height */
@@ -1063,59 +1230,115 @@ Footer > .footer--description { color: #94a3b8; }
 #top.g13 { height: 27; grid-size: 1 3; grid-columns: 1fr; grid-rows: 9 9 9; }
 
 Panel {
-    border: round #1e3a5f;
-    background: #0e1626;
-    color: #e2e8f0;
+    border: round $panel-lighten-3;
+    background: $surface;
+    color: $foreground;
     padding: 0 1;
     height: 1fr;
     width: 1fr;
     text-wrap: nowrap;
     text-overflow: ellipsis;
-    border-title-color: #7dd3fc;
+    border-title-color: $text-primary;
     border-title-style: bold;
 }
 
-#p_cpu { border-title-color: #38bdf8; }
-#p_mem { border-title-color: #a78bfa; }
-#p_disk { border-title-color: #22d3ee; }
-#p_net { border-title-color: #34d399; }
-#p_pi { border-title-color: #fb923c; }
-#p_hist { border-title-color: #f472b6; }
+#p_cpu { border-title-color: $text-primary; }
+#p_mem { border-title-color: $text-accent; }
+#p_disk { border-title-color: $text-secondary; }
+#p_net { border-title-color: $text-success; }
+#p_pi { border-title-color: $text-warning; }
+#p_hist { border-title-color: $text-primary; }
 
 #procsbox { height: 1fr; min-height: 5; margin: 0; }
 #filter {
     height: 1;
     border: none;
     padding: 0 1;
-    background: #0e1626;
-    color: #e2e8f0;
+    background: $surface;
+    color: $foreground;
     display: none;
 }
 #filter.visible { display: block; }
-#filter:focus { background: #132038; border: none; }
+#filter:focus { background: $panel; border: none; }
 #filter.-valid { border: none; }
 #p_procs {
     height: 1fr;
-    background: #0e1626;
-    border: round #1e3a5f;
+    background: $surface;
+    border: round $panel-lighten-3;
     margin: 0 1 0 0;
     padding: 0 1;
-    border-title-color: #7dd3fc;
+    border-title-color: $text-primary;
     border-title-style: bold;
     scrollbar-size: 0 0;
 }
+
+/* kill / signal confirmation */
+Confirm { align: center middle; background: $background 75%; }
+#dialog {
+    width: 64;
+    max-width: 92%;
+    height: auto;
+    border: round $text-warning;
+    background: $panel;
+    padding: 1 2;
+}
+#dialog.danger { border: round $text-error; }
+#dlg_title { color: $text-warning; text-style: bold; }
+#dialog.danger #dlg_title { color: $text-error; }
+#dlg_body { color: $foreground; padding: 1 0 0 0; }
+#dlg_keys { color: $foreground-muted; padding: 1 0 0 0; }
 """
 
 
 class Panel(Static):
     """Bordered dashboard panel with a border title."""
 
-    def __init__(self, title: str, id: str | None = None):
+    def __init__(self, title: str, id: str | None = None, classes: str | None = None):
         self.panel_title = title
-        super().__init__(id=id)
+        super().__init__(id=id, classes=classes)
 
     def on_mount(self) -> None:
         self.border_title = self.panel_title
+
+
+class ProcsPanel(Panel):
+    """Process panel: forwards clicks so the column headers can sort the table."""
+
+    def on_click(self, event: events.Click) -> None:
+        app = self.app
+        if isinstance(app, PistatApp):
+            # coordinates are relative to the border box: subtract the border
+            # (1) and the left padding (1) to land in content coordinates
+            app.header_click(event.x - 2, event.y - 1)
+
+
+class Confirm(ModalScreen[bool]):
+    """Yes/no modal for destructive actions. Returns True on yes."""
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("y", "yes", "Yes"),
+        Binding("n", "no", "No"),
+        Binding("escape", "no", "Cancel"),
+        Binding("enter", "yes", "y", show=False),
+    ]
+
+    def __init__(self, title: str, body: str, danger: bool = False):
+        super().__init__()
+        self.dialog_title = title
+        self.dialog_body = body
+        self.danger = danger
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog", classes="danger" if self.danger else ""):
+            yield Static(self.dialog_title, id="dlg_title")
+            yield Static(self.dialog_body, id="dlg_body")
+            yield Static("[y] yes     [n] no", id="dlg_keys")
+
+    def action_yes(self) -> None:
+        self.dismiss(True)
+
+    def action_no(self) -> None:
+        self.dismiss(False)
 
 
 class PistatApp(App):
@@ -1126,6 +1349,8 @@ class PistatApp(App):
         Binding("p", "toggle_pause", "Pause"),
         Binding("s", "cycle_sort", "Sort"),
         Binding("S", "reverse_sort", "Rev"),
+        Binding("x", "kill('term')", "Kill"),
+        Binding("X", "kill('kill')", "Kill -9", show=False),
         Binding("1", "interval('1')", "1s", show=False),
         Binding("2", "interval('2')", "2s", show=False),
         Binding("5", "interval('5')", "5s", show=False),
@@ -1141,7 +1366,7 @@ class PistatApp(App):
         Binding("end", "end", "Bottom", show=False),
         Binding("escape", "blur_filter", "Close", show=False),
     ]
-    SORTS: ClassVar[tuple[str, ...]] = ("cpu", "mem", "pid", "name", "cputime")
+    SORTS: ClassVar[tuple[str, ...]] = ("cpu", "mem", "pid", "name", "user", "cputime")
     ROW_H: ClassVar[int] = 9          # height of one panel band
     MIN_PROC_H: ClassVar[int] = 8     # border + header + status + 4 process rows
     PANELS: ClassVar[tuple[str, ...]] = (
@@ -1169,10 +1394,14 @@ class PistatApp(App):
         self.filter_text = ""
         self._timer = None
         self._panel_cache: dict[str, tuple[str, tuple]] = {}
+        self._col_spans: list[tuple[str, int, int]] = []
         self.sel = 0
         self.offset = 0
         self._rows: list[dict] = []
         self._view_h = 10
+        # our slate theme, and let the command palette switch to any other
+        self.register_theme(PISTAT_THEME)
+        self.theme = "pistat"
 
     # -- layout ----------------------------------------------------------- #
     def compose(self) -> ComposeResult:
@@ -1188,10 +1417,11 @@ class PistatApp(App):
             with Vertical(id="procsbox"):
                 yield Input(placeholder="filter: name / user / pid   ( / to focus · esc to clear )",
                             id="filter")
-                yield Panel("PROCESSES", id="p_procs")
+                yield ProcsPanel("PROCESSES", id="p_procs")
         yield Footer()
 
     def on_mount(self) -> None:
+        apply_palette(palette_from_theme(self.get_theme(self.theme)))
         self.set_timer(0.05, self.tick)
         self._start_timer()
         self.responsive()
@@ -1199,6 +1429,22 @@ class PistatApp(App):
         procs = self.query_one("#p_procs", Panel)
         procs.can_focus = True
         procs.focus()
+
+    def watch_theme(self, theme_name: str) -> None:
+        """Re-derive the panel palette whenever the theme changes.
+
+        Textual restyles the chrome itself (the CSS uses theme variables); this
+        keeps the hand-drawn Rich text in step, then forces a full repaint.
+        """
+        try:
+            apply_palette(palette_from_theme(self.get_theme(theme_name)))
+        except Exception:                 # noqa: BLE001 — never break a theme switch
+            return
+        self._panel_cache.clear()
+        if self.last is not None and self.is_mounted:
+            self.render_all(self.last)
+        if self.is_mounted:
+            self.notify(f"theme: {theme_name}", timeout=1.5)
 
     def _start_timer(self) -> None:
         if self._timer is not None:
@@ -1254,17 +1500,38 @@ class PistatApp(App):
             self.render_all(self.last)
 
     def action_cycle_sort(self) -> None:
-        i = self.SORTS.index(self.sort_key)
-        self.sort_key = self.SORTS[(i + 1) % len(self.SORTS)]
-        self.sel = self.offset = 0
-        self.notify(f"sort: {self.sort_key} {'desc' if self.reverse else 'asc'}", timeout=1.5)
-        if self.last:
-            self.render_procs(self.last)
+        keys = self.SORTS
+        i = keys.index(self.sort_key) if self.sort_key in keys else -1
+        self.sort_by(keys[(i + 1) % len(keys)], toggle=False)
 
     def action_reverse_sort(self) -> None:
         self.reverse = not self.reverse
+        self.notify(f"sort: {self.sort_key} {'desc' if self.reverse else 'asc'}", timeout=1.2)
         if self.last:
             self.render_procs(self.last)
+
+    def sort_by(self, key: str, toggle: bool = True) -> None:
+        """Sort by any column; clicking the active header flips the direction."""
+        if key not in SORT_KEYS:
+            return
+        if key == self.sort_key and toggle:
+            self.reverse = not self.reverse
+        elif key != self.sort_key:
+            self.sort_key = key
+            self.reverse = key not in SORT_ASC
+        self.sel = self.offset = 0
+        self.notify(f"sort: {key} {'desc' if self.reverse else 'asc'}", timeout=1.2)
+        if self.last:
+            self.render_procs(self.last)
+
+    def header_click(self, x: int, y: int) -> None:
+        """A click on the header row sorts by the column under the cursor."""
+        if y != 0 or not self._col_spans:
+            return
+        for key, start, end in self._col_spans:
+            if start <= x < end:
+                self.sort_by(key)
+                return
 
     def action_focus_filter(self) -> None:
         box = self.query_one("#filter", Input)
@@ -1296,6 +1563,48 @@ class PistatApp(App):
         c = self.collector
         c.peak_cpu = c.peak_mem = c.peak_temp = 0.0
         self.notify("peaks reset", timeout=1.5)
+
+    # -- signals ---------------------------------------------------------- #
+    def _selected_row(self) -> dict | None:
+        if 0 <= self.sel < len(self._rows):
+            return self._rows[self.sel]
+        return None
+
+    def action_kill(self, mode: str) -> None:
+        """x = SIGTERM, X = SIGKILL — always behind a confirmation."""
+        row = self._selected_row()
+        if row is None:
+            self.notify("no process selected", severity="warning", timeout=2)
+            return
+        pid, name = row["pid"], row["name"]
+        if pid <= 1 or pid == os.getpid():
+            self.notify(f"refusing to signal pid {pid} ({name})",
+                        severity="warning", timeout=3)
+            return
+        hard = mode == "kill"
+        signame = "SIGKILL" if hard else "SIGTERM"
+        signum = signal.SIGKILL if hard else signal.SIGTERM
+        body = ("Force kill — the process gets no chance to clean up."
+                if hard else "The process is asked to shut down cleanly.")
+        self.push_screen(
+            Confirm(f"{signame} → {name} (pid {pid}, user {row['user']})?",
+                    body, danger=hard),
+            lambda ok: self._send_signal(pid, name, signum, signame) if ok else None,
+        )
+
+    def _send_signal(self, pid: int, name: str, signum: int, signame: str) -> None:
+        try:
+            os.kill(pid, signum)
+        except ProcessLookupError:
+            self.notify(f"pid {pid} disappeared", timeout=3)
+        except PermissionError:
+            self.notify(f"not allowed to signal {name} ({pid}) — needs root",
+                        severity="error", timeout=4)
+        except OSError as err:
+            self.notify(f"kill {pid} failed: {err}", severity="error", timeout=4)
+        else:
+            self.notify(f"{signame} sent to {name} ({pid})", timeout=3)
+        self.set_timer(0.05, self.tick)
 
     # -- data loop -------------------------------------------------------- #
     async def tick(self) -> None:
@@ -1352,17 +1661,9 @@ class PistatApp(App):
                     if needle in r["name"].lower()
                     or needle in r["user"].lower()
                     or needle in str(r["pid"])]
-        key = self.sort_key
-        if key == "cpu":
-            rows.sort(key=lambda r: (r["cpu"], r["mem"]), reverse=self.reverse)
-        elif key == "mem":
-            rows.sort(key=lambda r: r["rss"], reverse=self.reverse)
-        elif key == "pid":
-            rows.sort(key=lambda r: r["pid"], reverse=self.reverse)
-        elif key == "name":
-            rows.sort(key=lambda r: r["name"].lower(), reverse=self.reverse)
-        elif key == "cputime":
-            rows.sort(key=lambda r: r["cputime"], reverse=self.reverse)
+        extract = SORT_KEYS.get(self.sort_key)
+        if extract is not None:
+            rows.sort(key=extract, reverse=self.reverse)
         return rows
 
     def render_procs(self, s: dict) -> None:
@@ -1384,7 +1685,15 @@ class PistatApp(App):
         self._view_h = view_h
 
         cols, cmd_w = pick_cols(w)
-        out = proc_header(cols, cmd_w)
+        # column hit-boxes for header clicks (content coordinates)
+        self._col_spans = []
+        x = 0
+        for c in cols:
+            cw = PROC_COLS[c][1]
+            self._col_spans.append((COL_SORT.get(c, ""), x, x + cw))
+            x += cw + 1
+        self._col_spans.append(("name", x, x + cmd_w))
+        out = proc_header(cols, cmd_w, self.sort_key, self.reverse)
         out.append("\n")
         for i in range(self.offset, min(len(rows), self.offset + view_h)):
             r = rows[i]
@@ -1562,7 +1871,7 @@ def once(interval: float, width: int | None = None, as_json: bool = False) -> No
 
     tbl_w = max(40, width - 4)         # the panel border eats two cells each side
     cols, cmd_w = pick_cols(tbl_w)
-    table = proc_header(cols, cmd_w)
+    table = proc_header(cols, cmd_w, sort_key="cpu", reverse=True)
     for r in sorted(s["procs"], key=lambda r: r["cpu"], reverse=True)[:10]:
         table.append("\n")
         table.append_text(proc_row(r, cols, cmd_w, col.cmdline(r["pid"])))

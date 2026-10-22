@@ -65,9 +65,9 @@ async def check(cols: int, rows: int) -> str:
             panel = app.query_one(pid)
             if not panel.display:
                 continue
-            body = getattr(panel, "renderable", None)
-            if body is None or not hasattr(body, "plain"):
-                continue
+            body = getattr(panel, "content", None)
+            if not hasattr(body, "plain"):
+                raise AssertionError(f"{label}: {pid} has no rendered text to check")
             lines = body.plain.split("\n")
             cw, ch = panel.content_size
             for i, line in enumerate(lines):

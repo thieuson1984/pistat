@@ -26,14 +26,18 @@ It drops the app in `~/.local/lib/pistat`, the launcher in `~/.local/bin/pistat`
 and installs `textual`/`rich`/`psutil` only if the system Python cannot already
 import a new enough `textual` — otherwise it builds a private venv, so it is
 PEP 668-safe on Debian/Ubuntu. It finishes by running `pistat --version` and a
-live `--json` snapshot, so a broken install fails loudly instead of later.
+live `--json` snapshot, so a broken install fails loudly instead of later — and
+then **starts pistat for you**, because installing and running should be one
+command, not two. Pass `--no-run` (or `PISTAT_NO_RUN=1`) when you install from a
+script, and it exits quietly after the summary.
 
 ```sh
 # variants (from the checkout, or: curl … | bash -s -- --system)
 ./install.sh --system            # /usr/local for every user (sudo)
 ./install.sh --prefix ~/opt      # custom prefix
-./install.sh --ref v1.1.0        # pin a tag/branch/commit
+./install.sh --ref v1.2.0        # pin a tag/branch/commit
 ./install.sh --python /usr/bin/python3
+./install.sh --no-run            # install only, do not launch
 ./install.sh --uninstall
 ```
 
@@ -61,6 +65,18 @@ The bottom panel is a sortable, scrollable process table: PID, user, nice,
 CPU %, memory %, RSS, threads, state, CPU time, full command line. Columns are
 shed one at a time as the terminal narrows — PID, CPU % and COMMAND always stay.
 
+**Sorting**: click any column header to sort by it; click the same header again
+to flip the direction. The active column carries an `↑`/`↓` and is underlined.
+`s` cycles the common keys, `S` reverses. Commands (`COMMAND` header) sort by
+process name. Keys available: cpu, mem, rss, pid, name, user, state, threads,
+nice, cputime.
+
+**Killing**: `x` sends SIGTERM to the selected process, `X` sends SIGKILL.
+Both open a confirmation dialog (`y` / `n`) showing the pid, user and signal —
+nothing is ever signalled without it. PID 1 and pistat itself are refused, and
+signalling another user's process needs the matching privilege (root), which
+the notification will tell you.
+
 `--once` prints the same panels plus the top 10 processes by CPU.
 
 ## Keys
@@ -69,13 +85,17 @@ shed one at a time as the terminal narrows — PID, CPU % and COMMAND always sta
 |---|---|
 | `q` | quit |
 | `p` | pause / resume sampling |
-| `s` | cycle sort: cpu → mem → pid → name → cputime |
+| `s` | cycle sort: cpu → mem → pid → name → user → cputime |
 | `S` | reverse sort order |
+| `x` | SIGTERM the selected process (asks first) |
+| `X` | SIGKILL the selected process (asks first) |
+| *click a header* | sort by that column; click again to reverse |
 | `/` | filter processes by name, user or PID (`esc` clears) |
 | `↑` `↓` / `k` `j` | move the selection |
 | `pgup` `pgdn` `home` `end` | page / jump |
 | `1` `2` `5` | sampling interval in seconds |
 | `r` | reset peak trackers |
+| `^p` | command palette — **Change theme** switches the whole colour scheme |
 
 ## Responsive layout
 
@@ -128,6 +148,21 @@ consumer never has to guess. Example cron entry:
 * * * * * /home/pi/.local/bin/pistat --json > /var/lib/node_exporter/textfile/pistat.json.tmp && mv …
 ```
 
+## Theming
+
+The chrome is drawn with Textual theme variables (`$background`, `$panel`,
+`$primary`, …) and the hand-drawn panels derive their colours from the active
+theme, so **`^p` → Change theme** recolours everything — including the bars and
+sparklines — and the choice survives for the session. `pistat` is registered as
+the default theme; the 20-odd built-ins (nord, gruvbox, catppuccin, solarized,
+dracula, tokyo-night, ansi-light …) are all selectable.
+
+Two details worth knowing: the `text-*` theme variables are used because they
+are contrast-corrected for text on the theme background, and any 8-digit
+`#RRGGBBAA` value is flattened onto the theme surface before it reaches Rich,
+which cannot parse alpha. `--once` has no Textual app, so it always uses the
+slate palette.
+
 ## Design notes
 
 - **Sampling** parses `/proc/<pid>/stat` directly (≈14 ms for ~200 processes,
@@ -149,6 +184,14 @@ consumer never has to guess. Example cron entry:
 - **Failing sensors never kill the UI**: every optional source (temps, disks,
   I/O, network, `vcgencmd`, `psutil.cpu_freq`) is individually guarded and
   degrades to `n/a`.
+- **Theming**: no panel hard-codes a colour. `palette_from_theme()` maps the
+  active Textual theme onto eleven colour roles, `watch_theme()` re-derives them
+  and repaints, and the CSS speaks only theme variables — so chrome and body
+  can never disagree.
+- **The cursor line is reverse video**, not a fixed blue background: readable on
+  light and dark themes without any contrast arithmetic.
+- **Signals are always confirmed** through a modal that names the pid, user and
+  signal; `x`/`X` never fire directly. PID 1 and pistat's own pid are refused.
 - Measured on this Pi 4 at 120 × 44: **≈11 % of one core (≈3 % of the whole
   machine)** at the 1 s default, ≈8 % at `-i 2`. For comparison `htop` runs at
   ≈2 % of a core.
@@ -162,6 +205,7 @@ failure. Run them from anywhere:
 ```sh
 python3 tests/test_layout.py     # every terminal size: list visible, nothing clipped
 python3 tests/test_keys.py       # bindings, sort cycle, filter, navigation
+python3 tests/test_features.py   # theme switching, header sorting, kill (SIGTERM/SIGKILL)
 python3 tests/test_cli.py        # --version/--json/--once/-w, interval clamp, no ANSI in a pipe
 python3 tests/test_headless.py   # full app render → screenshot.svg
 python3 tests/probe.py           # sizes/regions/classes at one or many sizes
@@ -181,6 +225,7 @@ screenshot.svg     last headless render (Textual SVG export)
 tests/             development harnesses and regression suites
   test_layout.py     responsive layout + clipping regression
   test_keys.py       key bindings / filter / navigation
+  test_features.py   theme switching, header sorting, kill signals
   test_cli.py        CLI contract (flags, JSON, width, clamping)
   test_headless.py   headless render, writes screenshot.svg
   probe.py           layout probe (sizes, regions, classes)

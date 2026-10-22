@@ -21,6 +21,8 @@ PREFIX="${PISTAT_PREFIX:-$HOME/.local}"
 PYTHON="${PISTAT_PYTHON:-}"
 MODE="user"
 ACTION="install"
+NO_RUN=0
+[ "${PISTAT_NO_RUN:-0}" = "1" ] && NO_RUN=1
 MIN_TEXTUAL="0.47"
 
 if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -45,10 +47,12 @@ Options:
   --system         install into /usr/local for all users (uses sudo if needed)
   --ref REF        git ref to install (branch/tag/commit, default: $REF)
   --python BIN     interpreter to use (default: first python3 >= 3.9 found)
+  --no-run         do not start pistat after a successful install
   --uninstall      remove the launcher and the installed copy
   -h, --help       this text
 
-Environment: PISTAT_PREFIX, PISTAT_REF, PISTAT_REPO, PISTAT_PYTHON, NO_COLOR
+Environment: PISTAT_PREFIX, PISTAT_REF, PISTAT_REPO, PISTAT_PYTHON,
+             PISTAT_NO_RUN=1, NO_COLOR
 
 If the repository is private, give the script a token (it is used for the
 script's own downloads too):
@@ -79,6 +83,7 @@ while [ $# -gt 0 ]; do
     --python)     [ $# -ge 2 ] || die "--python needs a path"
                   PYTHON="$2"; shift 2 ;;
     --python=*)   PYTHON="${1#*=}"; shift ;;
+    --no-run)     NO_RUN=1; shift ;;
     --uninstall|--remove) ACTION="uninstall"; shift ;;
     *)            warn "unknown option: $1"; usage; exit 2 ;;
   esac
@@ -255,9 +260,20 @@ case ":$PATH:" in
   *) warn "$BIN_DIR is not on your PATH — add it:"
      say "  echo 'export PATH=\"$BIN_DIR:\$PATH\"' >> ~/.profile" ;;
 esac
-say "${B}Installed.${N}"
+say "${B}Installed${N} — $LAUNCHER"
 say "  pistat               interactive TUI (q to quit)"
 say "  pistat --once        one plain-text snapshot"
 say "  pistat --json -i 0.5 machine-readable, good for cron/monitoring"
 say "  pistat --help        every flag and key"
 say "${D}Remove it with: bash install.sh --uninstall${PREFIX:+ --prefix $PREFIX}${N}"
+
+# --------------------------------------------------------------- start it up ---
+# Go straight into the TUI; asking the user to run it again after installing is
+# just busywork. Skipped with --no-run / PISTAT_NO_RUN=1 or without a terminal.
+if [ "$NO_RUN" = "0" ] && [ -r /dev/tty ] && [ -w /dev/tty ]; then
+  say ""
+  say "${D}starting pistat — q quits, ^p → Change theme${N}"
+  exec "$LAUNCHER" </dev/tty >/dev/tty 2>&1
+elif [ "$NO_RUN" = "0" ]; then
+  info "no terminal attached — start it yourself with: pistat"
+fi
