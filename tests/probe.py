@@ -1,27 +1,46 @@
-"""Headless layout probe: sizes, display flags, and any captured exceptions."""
+"""Headless layout probe: sizes, display flags and the resulting shape.
+
+    python3 tests/probe.py            # a spread of terminal sizes
+    python3 tests/probe.py 90 24      # one specific size
+"""
 import asyncio
 import sys
+from pathlib import Path
 
-sys.path.insert(0, "/home/kempi/pistat")
-from pistat import PistatApp  # noqa: E402
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from pistat import PistatApp
+
+PANELS = ("#p_cpu", "#p_mem", "#p_disk", "#p_net", "#p_pi", "#p_hist")
 
 
-async def probe(cols, rows):
+async def probe(cols: int, rows: int) -> None:
     app = PistatApp(interval=0.4)
     async with app.run_test(size=(cols, rows)) as pilot:
-        await asyncio.sleep(1.6)
+        await asyncio.sleep(1.4)
         await pilot.pause()
+        top = app.query_one("#top")
+        procs = app.query_one("#p_procs")
+        shown = [p.removeprefix("#p_") for p in PANELS if app.query_one(p).display]
         print(f"--- {cols}x{rows}")
-        print("  screen", app.size)
-        for wid in ("#top", "#procsbox", "#procs", "#filter", "#p_cpu", "#p_mem",
-                    "#p_disk", "#p_net", "#p_pi", "#p_hist"):
-            w = app.query_one(wid)
-            print(f"  {wid:<10} size={w.size} region={w.region} display={w.display} "
-                  f"classes={list(w.classes)}")
-        print("  table rows:", app.query_one("#procs").row_count)
-        attrs = [a for a in dir(app.query_one("#p_cpu")) if "content" in a or "render" in a]
-        print("  static attrs:", attrs[:12])
+        print(f"  screen   {app.size}")
+        print(f"  #top     {top.size} region={top.region} display={top.display} "
+              f"classes={list(top.classes)}")
+        print(f"  #procs   {procs.size} region={procs.region} view_h={app._view_h} "
+              f"rows={len(app._rows)}")
+        print(f"  panels   {shown}")
+        print(f"  overflow {procs.region.bottom - app.size.height:+d} rows")
 
 
-for spec in [(120, 44), (96, 30), (76, 26)]:
-    asyncio.run(probe(*spec))
+async def main() -> None:
+    args = sys.argv[1:]
+    if len(args) == 2:
+        await probe(int(args[0]), int(args[1]))
+        return
+    for spec in [(140, 50), (120, 44), (100, 30), (80, 26), (62, 20), (45, 14)]:
+        await probe(*spec)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

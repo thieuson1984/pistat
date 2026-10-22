@@ -1,0 +1,5 @@
+# pistat runtime dependencies
+# textual 0.47 introduced the grid/CSS APIs this dashboard relies on
+textual>=0.47
+rich>=13.0
+psutil>=5.9

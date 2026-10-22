@@ -1,4 +1,5 @@
 """Run pistat in a real PTY at a fixed size and dump the final screen via pyte."""
+import fcntl
 import os
 import pty
 import select
@@ -6,7 +7,6 @@ import signal
 import struct
 import sys
 import termios
-import fcntl
 import time
 
 import pyte

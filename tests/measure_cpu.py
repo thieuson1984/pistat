@@ -1,4 +1,5 @@
 """Measure pistat's own CPU load in a real PTY over N seconds."""
+import fcntl
 import os
 import pty
 import select
@@ -6,7 +7,6 @@ import signal
 import struct
 import sys
 import termios
-import fcntl
 import time
 
 COLS, ROWS, SECS = 120, 44, float(sys.argv[1]) if len(sys.argv) > 1 else 12.0

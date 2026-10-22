@@ -10,18 +10,21 @@ rolling sparklines, and a sortable process table with state statistics.
   pistat.py --once        one plain-text snapshot, then exit
   pistat.py -i 0.5        sampling interval in seconds (default 1.0)
 
-Keys: q quit · p pause · s cycle sort · S reverse · 1/2/5 interval · r reset peaks
+Keys: q quit · p pause · s cycle sort · S reverse · 1/2/5 interval · r reset
+      peaks · / filter · j/k or arrows move · PgUp/PgDn · Home/End
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import pwd
 import shutil
 import socket
 import subprocess
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -33,6 +36,12 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.widgets import Footer, Header, Input, Static
+
+__version__ = "1.1.0"
+
+MIN_INTERVAL = 0.1          # below this a 1 s timer would busy-loop the CPU
+DEFAULT_WIDTH = 100         # --once fallback width when stdout is a pipe
+NO_COLOR = bool(os.environ.get("NO_COLOR"))
 
 BAR_FULL = "█"
 BAR_EMPTY = "░"
@@ -163,16 +172,25 @@ def fit(text: Text, width: int) -> Text:
     """Clip every line to `width` cells so panels never wrap awkwardly."""
     if width <= 0:
         return text
-    out = Text()
     lines = text.split("\n")
+    # drop blank tail lines (trailing "\n") without repeatedly copying the Text
+    while len(lines) > 1 and not lines[-1].plain.strip():
+        lines.pop()
+    out = Text()
     for i, line in enumerate(lines):
         if i:
             out.append("\n")
         line.truncate(width)
         out.append_text(line)
-    while out.plain.endswith("\n"):
-        out = out[:-1]
     return out
+
+
+def pad(text: Text, width: int) -> Text:
+    """Right-pad a Text to `width` cells so a background style covers the row."""
+    gap = width - text.cell_len
+    if gap > 0:
+        text.append(" " * gap)
+    return text
 
 
 def kv(label: str, value, style: str = C_VAL, width: int = 8, pad: int = 0) -> Text:
@@ -190,6 +208,11 @@ def read_text(path: str) -> str | None:
         return Path(path).read_text().strip()
     except OSError:
         return None
+
+
+def norm(name: str) -> str:
+    """Normalise a sysfs sensor name: cpu-thermal == cpu_thermal == CPUThermal."""
+    return "".join(ch for ch in name.lower() if ch.isalnum())
 
 
 def fmt_uptime(sec: float) -> str:
@@ -253,14 +276,16 @@ class Collector:
         self._last_t: float | None = None
         self._net: dict[str, tuple[float, float]] = {}
         self._io: tuple[float, float] | None = None
+        self._swap: tuple[float, float] | None = None
+        self._swap_rate = (0.0, 0.0)
         self._procs: dict[int, psutil.Process] = {}
         self._users: dict[int, str] = {}
         self._uids: dict[int, int] = {}
         self._names: dict[int, str] = {}
         self._cpu_ticks: dict[int, tuple[int, int]] = {}
         self.has_proc = Path("/proc/self/stat").exists()
-        self._clk = os.sysconf("SC_CLK_TCK") if self.has_proc else 100
-        self._page = os.sysconf("SC_PAGE_SIZE") if self.has_proc else 4096
+        self._clk = self._sysconf("SC_CLK_TCK", 100)
+        self._page = self._sysconf("SC_PAGE_SIZE", 4096)
         self._cmdlines: dict[int, str] = {}
         self._pi_cache: dict = {}
         self._pi_ts: float = 0.0
@@ -276,31 +301,68 @@ class Collector:
         self.board = (read_text("/proc/device-tree/model") or "").replace("\x00", "")
         self.ncpu = psutil.cpu_count(logical=True) or 1
         # prime the CPU deltas so the first sample is meaningful
-        psutil.cpu_percent(interval=0.15, percpu=True)
-        self._processes(1.0, 1)
+        try:
+            psutil.cpu_percent(interval=0.15, percpu=True)
+        except (psutil.Error, OSError, NotImplementedError):
+            pass
+        self._processes(1.0, 0)
+
+    @staticmethod
+    def _sysconf(name: str, fallback: int) -> int:
+        try:
+            return int(os.sysconf(name))
+        except (ValueError, OSError, AttributeError):
+            return fallback
 
     # -- sensors ---------------------------------------------------------- #
     def _temperatures(self) -> dict[str, float]:
         temps: dict[str, float] = {}
-        for zone in sorted(Path("/sys/class/thermal").glob("thermal_zone*")):
-            raw = read_text(str(zone / "temp"))
-            kind = read_text(str(zone / "type")) or zone.name
-            if raw and raw.lstrip("-").isdigit():
-                temps[kind] = int(raw) / 1000.0
-        for hw in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
-            name = read_text(str(hw / "name")) or hw.name
-            for f in sorted(hw.glob("temp*_input")):
-                raw = read_text(str(f))
+        zones: set[str] = set()
+        try:
+            for zone in sorted(Path("/sys/class/thermal").glob("thermal_zone*")):
+                raw = read_text(str(zone / "temp"))
+                kind = read_text(str(zone / "type")) or zone.name
                 if raw and raw.lstrip("-").isdigit():
-                    value = int(raw) / 1000.0
-                    if any(abs(v - value) < 0.001 for v in temps.values()):
-                        continue  # same sensor exposed through hwmon and thermal_zone
-                    label = read_text(str(f).replace("_input", "_label"))
-                    temps[label or f"{name}/temp"] = value
+                    temps[kind] = int(raw) / 1000.0
+                    zones.add(norm(kind))
+        except OSError:
+            pass
+        try:
+            for hw in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
+                name = read_text(str(hw / "name")) or hw.name
+                same_die = norm(name) in zones
+                for f in sorted(hw.glob("temp*_input")):
+                    raw = read_text(str(f))
+                    if not (raw and raw.lstrip("-").isdigit()):
+                        continue
+                    # the die sensor is exported through both thermal_zone and
+                    # hwmon — skip the duplicate only when the driver names match,
+                    # so two genuinely distinct sensors at the same °C both survive
+                    if same_die:
+                        continue
+                    label = read_text(str(f)[: -len("_input")] + "_label")
+                    temps[label or f"{name}/temp"] = int(raw) / 1000.0
+        except OSError:
+            pass
         pmic = parse_vcg(vcgencmd("measure_temp pmic"))
         if pmic is not None:
             temps["pmic"] = pmic
         return temps
+
+    def _fans(self) -> dict[str, int]:
+        """Fan tachometers, if the case/HAT exposes any (Pi 4 has no SoC fan)."""
+        fans: dict[str, int] = {}
+        try:
+            for hw in sorted(Path("/sys/class/hwmon").glob("hwmon*")):
+                name = read_text(str(hw / "name")) or hw.name
+                for f in sorted(hw.glob("fan*_input")):
+                    raw = read_text(str(f))
+                    if raw and raw.isdigit():
+                        label = read_text(str(f)[: -len("_input")] + "_label")
+                        fans[label or name] = int(raw)
+        except OSError:
+            pass
+        return fans
 
     def _core_freqs(self) -> list[float]:
         freqs = []
@@ -309,12 +371,25 @@ class Collector:
             freqs.append(int(raw) / 1000.0 if raw and raw.isdigit() else 0.0)
         return freqs
 
+    def _uv_alarm(self) -> bool:
+        """rpi_volt hwmon latches an under-voltage alarm that survives reboots."""
+        try:
+            for hw in Path("/sys/class/hwmon").glob("hwmon*"):
+                if (read_text(str(hw / "name")) or "") == "rpi_volt":
+                    return read_text(str(hw / "in0_lcrit_alarm")) == "1"
+        except OSError:
+            pass
+        return False
+
     def _pi_block(self, ttl: float = 2.5) -> dict:
         """vcgencmd forks a process per call — refresh at most every `ttl` s."""
         now = time.monotonic()
         if self._pi_cache and now - self._pi_ts < ttl:
             return self._pi_cache
         ok, flags, raw = decode_throttled(vcgencmd("get_throttled"))
+        if self._uv_alarm():
+            flags = [*flags, "UV alarm latched (in0_lcrit)"]
+            ok = False
         clocks = {}
         for name in ("arm", "core", "v3d"):
             v = parse_vcg(vcgencmd(f"measure_clock {name}"))
@@ -397,6 +472,11 @@ class Collector:
                 continue
             seen.add(pid)
             prev = self._cpu_ticks.get(pid)
+            if prev is not None and prev[0] != starttime:
+                # pid recycled: cached user / name / cmdline belong to the old process
+                self._uids.pop(pid, None)
+                self._names.pop(pid, None)
+                self._cmdlines.pop(pid, None)
             if prev is None or prev[0] != starttime:
                 cpu = 0.0                      # new (or recycled) pid: no baseline yet
             else:
@@ -495,7 +575,10 @@ class Collector:
         self._last_t = now
         wall = time.time()
 
-        per_core = psutil.cpu_percent(interval=None, percpu=True) or [0.0]
+        try:
+            per_core = psutil.cpu_percent(interval=None, percpu=True) or [0.0]
+        except (psutil.Error, NotImplementedError):
+            per_core = [0.0] * self.ncpu
         cpu_total = sum(per_core) / len(per_core)
         try:
             load = os.getloadavg()
@@ -505,17 +588,32 @@ class Collector:
         vm, sw = psutil.virtual_memory(), psutil.swap_memory()
         temps = self._temperatures()
         soc_temp = temps.get("cpu-thermal") or temps.get("cpu_thermal")
-        if soc_temp is None and temps:
-            soc_temp = max(v for k, v in temps.items() if k != "pmic") if len(temps) > 1 else max(temps.values())
+        if soc_temp is None:
+            # never mistake the PMIC (board regulator) for the SoC
+            die = {k: v for k, v in temps.items() if k != "pmic"}
+            if die:
+                soc_temp = max(die.values())
+
+        # psutil's sin/sout are cumulative bytes since boot — derive real rates
+        if self._swap is not None:
+            self._swap_rate = (
+                max(0.0, (sw.sin - self._swap[0]) / dt),
+                max(0.0, (sw.sout - self._swap[1]) / dt),
+            )
+        self._swap = (sw.sin, sw.sout)
 
         mounts, seen = [], set()
-        for p in psutil.disk_partitions(all=False):
+        try:
+            parts = psutil.disk_partitions(all=False)
+        except (psutil.Error, OSError):
+            parts = []
+        for p in parts:
             if p.device in seen or not p.device.startswith("/dev"):
                 continue
             seen.add(p.device)
             try:
                 u = psutil.disk_usage(p.mountpoint)
-            except OSError:
+            except (psutil.Error, OSError):
                 continue
             mounts.append(
                 {
@@ -585,10 +683,13 @@ class Collector:
         if soc_temp is not None:
             self.peak_temp = max(self.peak_temp, soc_temp)
 
-        freq = psutil.cpu_freq()
+        try:
+            freq = psutil.cpu_freq()
+        except (psutil.Error, NotImplementedError):
+            freq = None
         return {
             "ts": wall,
-            "uptime": wall - psutil.boot_time(),
+            "uptime": self._uptime(wall),
             "cpu_total": cpu_total,
             "per_core": per_core,
             "core_freqs": self._core_freqs(),
@@ -596,12 +697,16 @@ class Collector:
             "freq": freq.current if freq else 0.0,
             "mem": vm,
             "swap": sw,
+            "swap_rate": self._swap_rate,
             "temps": temps,
+            "fans": self._fans(),
             "soc_temp": soc_temp,
             "mounts": mounts[:4],
+            "mounts_total": len(mounts),
             "io": io_rate,
             "io_totals": self._io_totals,
             "nets": nets[:3],
+            "nets_total": len(nets),
             "procs": rows,
             "states": states,
             "threads": threads,
@@ -613,11 +718,25 @@ class Collector:
             "peak_temp": self.peak_temp,
         }
 
+    @staticmethod
+    def _uptime(wall: float) -> float:
+        """/proc/uptime is exact and free; psutil.boot_time() is the fallback."""
+        raw = read_text("/proc/uptime")
+        if raw:
+            try:
+                return float(raw.split()[0])
+            except (IndexError, ValueError):
+                pass
+        try:
+            return wall - psutil.boot_time()
+        except (psutil.Error, OSError):
+            return 0.0
+
 
 # --------------------------------------------------------------------------- #
 # renderers — pure (snapshot, width) -> rich Text; shared by TUI and --once
 # --------------------------------------------------------------------------- #
-def render_cpu(s: dict, width: int = 46) -> Text:
+def render_cpu(s: dict, width: int = 46, height: int | None = None) -> Text:
     t = Text()
     bw = max(8, min(12, width - 20))
     load, gov = s["load"], s["pi"].get("governor") or "n/a"
@@ -637,13 +756,20 @@ def render_cpu(s: dict, width: int = 46) -> Text:
     t.append_text(bar(total, bw, tc))
     t.append(f" {total:5.1f}%\n", style=tc)
 
-    for i, pct in enumerate(s["per_core"]):
+    cores = s["per_core"]
+    # three header lines + one line per core; keep the "+N more" note visible
+    room = len(cores) if height is None else max(1, height - 3)
+    if len(cores) > room:
+        room = max(1, room - 1)
+    for i, pct in enumerate(cores[:room]):
         c = usage_style(pct)
         f = s["core_freqs"][i] if i < len(s["core_freqs"]) else 0
         t.append(f"cpu{i:<2}  ", style=C_LABEL)
         t.append_text(bar(pct, bw, c))
         t.append(f" {pct:5.1f}%", style=c)
         t.append(f" {f/1000:4.2f}G\n" if f else "\n", style=C_DIM)
+    if len(cores) > room:
+        t.append(f"… {len(cores) - room} more cores\n", style=C_DIM)
     return t
 
 
@@ -658,15 +784,22 @@ def render_mem(s: dict, width: int = 46) -> Text:
     t.append(f" {vm.percent:4.1f}%", style=mc)
     t.append(f" {human_short(vm.used)}/{human_short(vm.total)}\n", style=C_VAL)
 
-    sc = C_OK if sw.percent < 25 else (C_WARN if sw.percent < 60 else C_BAD)
-    t.append("swap   ", style=C_LABEL)
-    t.append_text(bar(sw.percent, bw, sc))
-    t.append(f" {sw.percent:4.1f}%", style=sc)
-    t.append(f" {human_short(sw.used)}/{human_short(sw.total)}\n", style=C_VAL)
+    if not sw.total:
+        t.append("swap   ", style=C_LABEL)
+        t.append("disabled\n", style=C_DIM)
+        t.append("swapio ", style=C_LABEL)
+        t.append("—\n", style=C_DIM)
+    else:
+        sc = C_OK if sw.percent < 25 else (C_WARN if sw.percent < 60 else C_BAD)
+        t.append("swap   ", style=C_LABEL)
+        t.append_text(bar(sw.percent, bw, sc))
+        t.append(f" {sw.percent:4.1f}%", style=sc)
+        t.append(f" {human_short(sw.used)}/{human_short(sw.total)}\n", style=C_VAL)
 
-    t.append("swapio ", style=C_LABEL)
-    t.append(f"in {human_rate(sw.sin)}", style=C_ACCENT)
-    t.append(f"  out {human_rate(sw.sout)}\n", style=C_WARN)
+        sin, sout = s.get("swap_rate", (0.0, 0.0))
+        t.append("swapio ", style=C_LABEL)
+        t.append(f"in {human_rate(sin)}", style=C_ACCENT)
+        t.append(f"  out {human_rate(sout)}\n", style=C_WARN)
     t.append_text(kv("free", human_short(vm.available), C_OK, 7, pad=7))
     t.append_text(kv("cache", human_short(getattr(vm, "cached", 0)), C_DIM, 7))
     t.append("\n")
@@ -707,7 +840,11 @@ def render_disk(s: dict, width: int = 46) -> Text:
     t.append(f"{human_rate(io['write']):>9}\n", style=C_WARN)
     t.append("tot ", style=C_LABEL)
     t.append(f"r {human_short(tot[0])}", style=C_DIM)
-    t.append(f"  w {human_short(tot[1])}\n", style=C_DIM)
+    t.append(f"  w {human_short(tot[1])}", style=C_DIM)
+    hidden = s.get("mounts_total", len(s["mounts"])) - len(s["mounts"])
+    if hidden > 0:
+        t.append(f"  +{hidden} mount{'s' if hidden != 1 else ''}", style=C_WARN)
+    t.append("\n")
     if s["mounts"]:
         root = s["mounts"][0]
         t.append("free ", style=C_LABEL)
@@ -737,6 +874,9 @@ def render_net(s: dict, width: int = 46) -> Text:
     t.append("total  ", style=C_LABEL)
     t.append(f"rx {human_short(sum(n['rx_total'] for n in nets))}", style=C_DIM)
     t.append(f"  tx {human_short(sum(n['tx_total'] for n in nets))}", style=C_DIM)
+    hidden = s.get("nets_total", len(nets)) - len(nets)
+    if hidden > 0:
+        t.append(f"  +{hidden} iface{'s' if hidden != 1 else ''}", style=C_WARN)
     return t
 
 
@@ -783,7 +923,12 @@ def render_pi(s: dict, width: int = 46) -> Text:
         t.append("v3d ", style=C_DIM)
         t.append(f"{cl['v3d']/1e9:.2f}G  ", style=C_VAL)
     t.append("volt ", style=C_DIM)
-    t.append(f"{pi['volts']:.3f}V\n" if pi["volts"] else "n/a\n", style=C_VAL)
+    t.append(f"{pi['volts']:.3f}V" if pi["volts"] else "n/a", style=C_VAL)
+    fans = s.get("fans") or {}
+    if fans:
+        t.append("  fan ", style=C_LABEL)
+        t.append(f"{max(fans.values())}rpm", style=C_VAL)
+    t.append("\n")
 
     t.append("board  ", style=C_LABEL)
     t.append(short_board(s["board"])[:24] + "\n", style=C_DIM)
@@ -824,6 +969,80 @@ def render_hist(s: dict, c: Collector, width: int = 46) -> Text:
 
 
 # --------------------------------------------------------------------------- #
+# process table — one column model shared by the TUI and --once
+# --------------------------------------------------------------------------- #
+# key: (header, width, alignment)
+PROC_COLS: dict[str, tuple[str, int, str]] = {
+    "pid": ("PID", 7, ">"),
+    "user": ("USER", 9, "<"),
+    "ni": ("NI", 2, ">"),
+    "cpu": ("CPU%", 5, ">"),
+    "mem": ("MEM%", 5, ">"),
+    "rss": ("RSS", 6, ">"),
+    "thr": ("THR", 4, ">"),
+    "state": ("STATE", 9, "<"),
+    "time": ("TIME+", 7, ">"),
+}
+PROC_ORDER = ("pid", "user", "ni", "cpu", "mem", "rss", "thr", "state", "time")
+# shed in this order as the terminal narrows: PID, CPU% and COMMAND always stay
+PROC_DROP = ("ni", "thr", "time", "user", "state", "mem", "rss")
+MIN_CMD = 12
+
+
+def pick_cols(width: int) -> tuple[list[str], int]:
+    """Which columns fit in `width` cells, and how wide COMMAND can be."""
+    cols = list(PROC_ORDER)
+
+    def used(cs: list[str]) -> int:
+        return sum(PROC_COLS[c][1] + 1 for c in cs) + 2   # gutters + gap before COMMAND
+
+    for c in PROC_DROP:
+        if used(cols) + MIN_CMD <= width:
+            break
+        if c in cols:
+            cols.remove(c)
+    return cols, max(6, width - used(cols))
+
+
+def proc_header(cols: list[str], cmd_w: int) -> Text:
+    t = Text(style=C_TITLE)
+    for c in cols:
+        head, w, al = PROC_COLS[c]
+        t.append(f"{head:{al}{w}} ")
+    t.append(f"{'COMMAND':<{cmd_w}}")
+    return t
+
+
+def proc_row(r: dict, cols: list[str], cmd_w: int, command: str,
+             selected: bool = False) -> Text:
+    cpu, mem = r["cpu"], r["mem"]
+    cstyle = C_DIM if cpu < 1 else (C_ACCENT if cpu < 40 else C_WARN if cpu < 90 else C_BAD)
+    mstyle = C_DIM if mem < 1 else (C_ACCENT if mem < 25 else C_WARN)
+    sstyle = {"running": C_OK, "zombie": C_BAD, "stopped": C_WARN}.get(r["state"], C_DIM)
+    rss = human_bytes(r["rss"])
+    if len(rss) > PROC_COLS["rss"][1]:
+        rss = human_short(r["rss"])
+    cells = {
+        "pid": (str(r["pid"]), C_VAL),
+        "user": (r["user"], C_DIM),
+        "ni": (str(r["nice"]), C_DIM),
+        "cpu": (f"{cpu:.1f}", cstyle),
+        "mem": (f"{mem:.1f}", mstyle),
+        "rss": (rss, C_VAL),
+        "thr": (str(r["threads"]), C_DIM),
+        "state": (r["state"], sstyle),
+        "time": (fmt_cpu_time(r["cputime"]), C_DIM),
+    }
+    line = Text(style="on #1d4ed8" if selected else "")
+    for c in cols:
+        _head, w, al = PROC_COLS[c]
+        text, style = cells[c]
+        line.append(f"{text[:w]:{al}{w}} ", style=style)
+    line.append(command[:cmd_w], style=C_VAL)
+    return line
+
+
+# --------------------------------------------------------------------------- #
 # Textual UI
 # --------------------------------------------------------------------------- #
 CSS = """
@@ -833,11 +1052,15 @@ Footer { background: #111c33; }
 Footer > .footer--key { background: #1e293b; color: #7dd3fc; text-style: bold; }
 Footer > .footer--description { color: #94a3b8; }
 #body { height: 1fr; padding: 0 1; }
-#top { layout: grid; grid-gutter: 0 1; }
-#top.wide { height: 19; grid-size: 3 2; grid-columns: 1fr 1fr 1fr; grid-rows: 9 10; }
-#top.mid { height: 18; grid-size: 2 2; grid-columns: 1fr 1fr; grid-rows: 9 9; }
-#top.short { height: 9; grid-size: 2 1; grid-columns: 1fr 1fr; grid-rows: 9; }
-#top.narrow { height: 18; grid-size: 1 2; grid-columns: 1fr; grid-rows: 9 9; }
+#top { layout: grid; grid-gutter: 0 1; height: 18; overflow: hidden; }
+/* g<cols><bands> — every band is 9 rows tall, so the grid always matches its height */
+#top.g31 { height: 9;  grid-size: 3 1; grid-columns: 1fr 1fr 1fr; grid-rows: 9; }
+#top.g32 { height: 18; grid-size: 3 2; grid-columns: 1fr 1fr 1fr; grid-rows: 9 9; }
+#top.g21 { height: 9;  grid-size: 2 1; grid-columns: 1fr 1fr; grid-rows: 9; }
+#top.g22 { height: 18; grid-size: 2 2; grid-columns: 1fr 1fr; grid-rows: 9 9; }
+#top.g11 { height: 9;  grid-size: 1 1; grid-columns: 1fr; grid-rows: 9; }
+#top.g12 { height: 18; grid-size: 1 2; grid-columns: 1fr; grid-rows: 9 9; }
+#top.g13 { height: 27; grid-size: 1 3; grid-columns: 1fr; grid-rows: 9 9 9; }
 
 Panel {
     border: round #1e3a5f;
@@ -903,10 +1126,10 @@ class PistatApp(App):
         Binding("p", "toggle_pause", "Pause"),
         Binding("s", "cycle_sort", "Sort"),
         Binding("S", "reverse_sort", "Rev"),
-        Binding("1", "interval('1')", "1s"),
-        Binding("2", "interval('2')", "2s"),
-        Binding("5", "interval('5')", "5s"),
-        Binding("r", "reset_peaks", "Reset"),
+        Binding("1", "interval('1')", "1s", show=False),
+        Binding("2", "interval('2')", "2s", show=False),
+        Binding("5", "interval('5')", "5s", show=False),
+        Binding("r", "reset_peaks", "Reset", show=False),
         Binding("slash", "focus_filter", "Filter"),
         Binding("up", "move('-1')", "Up", show=False),
         Binding("down", "move('1')", "Down", show=False),
@@ -919,6 +1142,21 @@ class PistatApp(App):
         Binding("escape", "blur_filter", "Close", show=False),
     ]
     SORTS: ClassVar[tuple[str, ...]] = ("cpu", "mem", "pid", "name", "cputime")
+    ROW_H: ClassVar[int] = 9          # height of one panel band
+    MIN_PROC_H: ClassVar[int] = 8     # border + header + status + 4 process rows
+    PANELS: ClassVar[tuple[str, ...]] = (
+        "#p_cpu", "#p_disk", "#p_pi", "#p_mem", "#p_net", "#p_hist",
+    )
+    # (columns, bands) -> panels kept, in compose order
+    SHAPES: ClassVar[dict[tuple[int, int], tuple[str, ...]]] = {
+        (3, 2): ("#p_cpu", "#p_disk", "#p_pi", "#p_mem", "#p_net", "#p_hist"),
+        (3, 1): ("#p_cpu", "#p_disk", "#p_pi"),
+        (2, 2): ("#p_cpu", "#p_disk", "#p_pi", "#p_mem"),
+        (2, 1): ("#p_cpu", "#p_pi"),
+        (1, 3): ("#p_cpu", "#p_pi", "#p_mem"),
+        (1, 2): ("#p_cpu", "#p_pi"),
+        (1, 1): ("#p_cpu",),
+    }
 
     def __init__(self, interval: float = 1.0):
         super().__init__()
@@ -930,10 +1168,9 @@ class PistatApp(App):
         self.last: dict | None = None
         self.filter_text = ""
         self._timer = None
-        self._panel_cache: dict[str, str] = {}
+        self._panel_cache: dict[str, tuple[str, tuple]] = {}
         self.sel = 0
         self.offset = 0
-        self._sel_pid: int | None = None
         self._rows: list[dict] = []
         self._view_h = 10
 
@@ -973,30 +1210,34 @@ class PistatApp(App):
         self.responsive()
 
     def responsive(self) -> None:
-        """3 columns when there is room, 2 when narrower, 1 on tiny terminals."""
+        """Pick the panel grid from the *available* height, not just the width.
+
+        Every band is ROW_H rows tall. Bands are only added while the process
+        list keeps MIN_PROC_H rows; when nothing fits, the grid is dropped
+        entirely so the list gets the whole window instead of being clipped.
+        """
         h, w = self.size.height, self.size.width
-        top = self.query_one("#top")
-        hist = self.query_one("#p_hist", Panel)
-        net = self.query_one("#p_net", Panel)
-        mem = self.query_one("#p_mem", Panel)
-        disk = self.query_one("#p_disk", Panel)
+        body = max(4, h - 2)                       # Header + Footer take two rows
+        cols = 3 if w >= 104 else 2 if w >= 62 else 1
+        bands = 0
+        if body >= self.ROW_H + self.MIN_PROC_H:
+            bands = (body - self.MIN_PROC_H) // self.ROW_H
+        bands = max(0, min(bands, 2 if cols > 1 else 3))
 
-        wide = w >= 104 and h >= 34
-        mid = w >= 80 and h >= 26
-        short = not mid and w >= 62
-        hist.display = wide
-        net.display = wide
-        mem.display = wide or mid
-        disk.display = wide or mid
-
-        if wide:
-            top.set_classes("wide")
-        elif mid:
-            top.set_classes("mid")
-        elif short:
-            top.set_classes("short")
+        top = self.query_one("#top", Vertical)
+        shape = self.SHAPES.get((cols, bands))
+        if shape is None:                          # nothing usable fits
+            top.display = False
+            for panel_id in self.PANELS:
+                self.query_one(panel_id, Panel).display = False
         else:
-            top.set_classes("narrow")
+            top.display = True
+            top.set_classes(f"g{cols}{bands}")
+            for panel_id in self.PANELS:
+                self.query_one(panel_id, Panel).display = panel_id in shape
+        self._panel_cache.clear()
+        if self.last:
+            self.render_all(self.last)
 
     # -- actions ---------------------------------------------------------- #
     def action_interval(self, seconds: str) -> None:
@@ -1016,7 +1257,6 @@ class PistatApp(App):
         i = self.SORTS.index(self.sort_key)
         self.sort_key = self.SORTS[(i + 1) % len(self.SORTS)]
         self.sel = self.offset = 0
-        self._sel_pid = None
         self.notify(f"sort: {self.sort_key} {'desc' if self.reverse else 'asc'}", timeout=1.5)
         if self.last:
             self.render_procs(self.last)
@@ -1032,20 +1272,19 @@ class PistatApp(App):
         box.focus()
 
     def action_blur_filter(self) -> None:
+        """esc always clears the filter and hides the box — focused or not."""
         box = self.query_one("#filter", Input)
-        if box.has_focus:
-            if box.value:
-                box.value = ""
-                self.filter_text = ""
-                if self.last:
-                    self.render_procs(self.last)
-            box.remove_class("visible")
-            self.query_one("#p_procs", Panel).focus()
+        if box.value or self.filter_text:
+            box.value = ""            # fires on_input_changed -> clears + repaints
+            self.filter_text = ""
+            if self.last:
+                self.render_procs(self.last)
+        box.remove_class("visible")
+        self.query_one("#p_procs", Panel).focus()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         self.filter_text = event.value.strip().lower()
         self.sel = self.offset = 0
-        self._sel_pid = None
         if self.last:
             self.render_procs(self.last)
 
@@ -1079,21 +1318,25 @@ class PistatApp(App):
     def render_all(self, s: dict) -> None:
         guess = max(30, self.size.width // 3 - 4)
         painters = {
-            "#p_cpu": render_cpu,
-            "#p_mem": render_mem,
-            "#p_disk": render_disk,
-            "#p_net": render_net,
-            "#p_pi": render_pi,
-            "#p_hist": lambda snap, w: render_hist(snap, self.collector, w),
+            "#p_cpu": lambda snap, w, h: render_cpu(snap, w, h),
+            "#p_mem": lambda snap, w, _h: render_mem(snap, w),
+            "#p_disk": lambda snap, w, _h: render_disk(snap, w),
+            "#p_net": lambda snap, w, _h: render_net(snap, w),
+            "#p_pi": lambda snap, w, _h: render_pi(snap, w),
+            "#p_hist": lambda snap, w, _h: render_hist(snap, self.collector, w),
         }
         for panel_id, render in painters.items():
             panel = self.query_one(panel_id, Panel)
             if not panel.display:
                 continue
             w = self._width(panel_id, guess)
-            body = fit(render(s, w), w)
-            if self._panel_cache.get(panel_id) != body.plain:
-                self._panel_cache[panel_id] = body.plain
+            h = panel.content_size.height or 6
+            body = fit(render(s, w, h), w)
+            # repaint when the text *or* the styling changes: a bar can cross a colour
+            # threshold while the percentage string stays identical
+            key = (body.plain, tuple(body.spans))
+            if self._panel_cache.get(panel_id) != key:
+                self._panel_cache[panel_id] = key
                 panel.update(body)
         self.sub_title = (
             f"{s['host']} · {self.interval:g}s · up {fmt_uptime(s['uptime'])}"
@@ -1140,41 +1383,28 @@ class PistatApp(App):
         self.offset = max(0, min(self.offset, max(0, len(rows) - view_h)))
         self._view_h = view_h
 
-        cmd_w = max(8, w - 63)
-        out = Text()
-        out.append(
-            f"{'PID':>6} {'USER':<9} {'NI':>2} {'CPU%':>5} {'MEM%':>4} {'RSS':>6} "
-            f"{'THR':>4} {'STATE':<9} {'TIME+':>7}  {'COMMAND':<{cmd_w}}\n",
-            style=C_TITLE,
-        )
-
+        cols, cmd_w = pick_cols(w)
+        out = proc_header(cols, cmd_w)
+        out.append("\n")
         for i in range(self.offset, min(len(rows), self.offset + view_h)):
             r = rows[i]
-            cpu, mem = r["cpu"], r["mem"]
-            cstyle = C_DIM if cpu < 1 else (C_ACCENT if cpu < 40 else C_WARN if cpu < 90 else C_BAD)
-            mstyle = C_DIM if mem < 1 else (C_ACCENT if mem < 25 else C_WARN)
-            sstyle = {"running": C_OK, "zombie": C_BAD, "stopped": C_WARN}.get(r["state"], C_DIM)
-            line = Text(style="on #1d4ed8" if i == self.sel else "")
-            line.append(f"{r['pid']:>6} ", style=C_VAL)
-            line.append(f"{r['user']:<9} ", style=C_DIM)
-            line.append(f"{r['nice']:>2} ", style=C_DIM)
-            line.append(f"{cpu:>5.1f} ", style=cstyle)
-            line.append(f"{mem:>4.1f} ", style=mstyle)
-            line.append(f"{human_bytes(r['rss']):>6} ", style=C_VAL)
-            line.append(f"{r['threads']:>4} ", style=C_DIM)
-            line.append(f"{r['state']:<9} ", style=sstyle)
-            line.append(f"{fmt_cpu_time(r['cputime']):>7}  ", style=C_DIM)
-            line.append(self.collector.cmdline(r["pid"])[:cmd_w], style=C_VAL)
+            line = proc_row(r, cols, cmd_w, self.collector.cmdline(r["pid"]),
+                            selected=(i == self.sel))
+            if i == self.sel:
+                pad(line, w)
             out.append_text(line)
             out.append("\n")
 
+        status = Text()
         if self.filter_text:
-            out.append(f"filter '{self.filter_text}' · {len(rows)} match(es)", style=C_WARN)
+            status.append(f"filter '{self.filter_text}' · {len(rows)} match(es)", style=C_WARN)
         elif len(rows) > view_h:
-            out.append(f"{self.offset + 1}-{min(len(rows), self.offset + view_h)}"
-                       f" of {len(rows)} processes", style=C_DIM)
+            status.append(f"{self.offset + 1}-{min(len(rows), self.offset + view_h)}"
+                          f" of {len(rows)} processes", style=C_DIM)
         else:
-            out.append(f"{len(rows)} processes", style=C_DIM)
+            status.append(f"{len(rows)} processes", style=C_DIM)
+        status.append(f"  ·  sort {self.sort_key} {'desc' if self.reverse else 'asc'}", style=C_DIM)
+        out.append_text(status)
         panel.update(fit(out, w))
 
     # -- list navigation -------------------------------------------------- #
@@ -1207,17 +1437,113 @@ class PistatApp(App):
 # --------------------------------------------------------------------------- #
 # one-shot mode (handy for scripts, cron, or SSH one-liners)
 # --------------------------------------------------------------------------- #
-def once(interval: float) -> None:
-    from rich.columns import Columns
+def term_width(explicit: int | None = None) -> int:
+    """Output width for --once/--json: explicit flag, terminal size, or default."""
+    if explicit:
+        return max(40, explicit)
+    try:
+        cols = shutil.get_terminal_size((DEFAULT_WIDTH, 24)).columns
+    except OSError:                                    # pragma: no cover
+        cols = DEFAULT_WIDTH
+    return max(40, min(240, cols))
+
+
+def snapshot_json(s: dict, col: Collector, top: int = 10) -> dict:
+    """Stable, script-friendly view of one snapshot (no rich objects inside)."""
+    vm, sw = s["mem"], s["swap"]
+    io_read, io_write = s["io"]["read"], s["io"]["write"]
+    net_rx = sum(n["rx"] for n in s["nets"])
+    net_tx = sum(n["tx"] for n in s["nets"])
+    rows = sorted(s["procs"], key=lambda r: r["cpu"], reverse=True)[:top]
+    return {
+        "host": s["host"],
+        "board": s["board"],
+        "pistat": __version__,
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(s["ts"])),
+        "timestamp": round(s["ts"], 3),
+        "uptime_s": round(s["uptime"], 1),
+        "cpu": {
+            "total_pct": round(s["cpu_total"], 1),
+            "per_core_pct": [round(c, 1) for c in s["per_core"]],
+            "per_core_mhz": [round(f, 0) for f in s["core_freqs"]],
+            "load": [round(x, 2) for x in s["load"]],
+            "governor": s["pi"].get("governor"),
+            "peak_pct": round(s["peak_cpu"], 1),
+        },
+        "memory": {
+            "used": vm.used, "total": vm.total, "available": vm.available,
+            "cached": getattr(vm, "cached", 0), "percent": round(vm.percent, 1),
+            "peak_percent": round(s["peak_mem"], 1),
+        },
+        "swap": {
+            "used": sw.used, "total": sw.total, "percent": round(sw.percent, 1),
+            "in_bps": round(s["swap_rate"][0], 1), "out_bps": round(s["swap_rate"][1], 1),
+        },
+        "thermal": {
+            "soc_c": round(s["soc_temp"], 1) if s["soc_temp"] is not None else None,
+            "peak_c": round(s["peak_temp"], 1),
+            "sensors_c": {k: round(v, 1) for k, v in s["temps"].items()},
+            "fans_rpm": s["fans"],
+            "throttled_hex": s["pi"]["throttle_raw"],
+            "throttle_flags": s["pi"]["throttle_flags"],
+            "core_volts": s["pi"]["volts"],
+            "clocks_hz": s["pi"]["clocks"],
+        },
+        "disk": {
+            "mounts": [
+                {
+                    "mount": m["mount"], "device": m["device"], "fstype": m["fstype"],
+                    "total": m["total"], "used": m["used"], "percent": round(m["pct"], 1),
+                }
+                for m in s["mounts"]
+            ],
+            "io_read_bps": round(io_read, 1), "io_write_bps": round(io_write, 1),
+            "io_read_total": s["io_totals"][0], "io_write_total": s["io_totals"][1],
+        },
+        "network": {
+            "interfaces": [
+                {
+                    "name": n["name"], "ip": n["ip"], "state": n["state"],
+                    "rx_bps": round(n["rx"], 1), "tx_bps": round(n["tx"], 1),
+                    "rx_total": n["rx_total"], "tx_total": n["tx_total"],
+                }
+                for n in s["nets"]
+            ],
+            "rx_bps": round(net_rx, 1), "tx_bps": round(net_tx, 1),
+        },
+        "processes": {
+            "count": len(s["procs"]), "threads": s["threads"], "states": s["states"],
+            "top": [
+                {
+                    "pid": r["pid"], "user": r["user"], "name": r["name"],
+                    "cpu_pct": round(r["cpu"], 1), "mem_pct": round(r["mem"], 1),
+                    "rss": r["rss"], "threads": r["threads"], "state": r["state"],
+                    "cputime_s": round(r["cputime"], 1),
+                }
+                for r in rows
+            ],
+        },
+    }
+
+
+def once(interval: float, width: int | None = None, as_json: bool = False) -> None:
     from rich.console import Console
-    from rich.panel import Panel as RPanel
 
     col = Collector()
-    col.sample()
-    time.sleep(max(0.2, interval))
+    col.sample()                       # prime the counters
+    time.sleep(max(0.2, interval))     # ...measure over one interval
     s = col.sample()
 
-    console = Console(width=104)
+    if as_json:
+        print(json.dumps(snapshot_json(s, col), indent=2))
+        return
+
+    from rich.columns import Columns
+    from rich.panel import Panel as RPanel
+
+    width = width or term_width()
+    console = Console(width=width, no_color=NO_COLOR)
+
     head = Text(f"{s['host']}  ·  {short_board(s['board'])}  ·  up {fmt_uptime(s['uptime'])}")
     head.append(f"  ·  {len(s['procs'])} procs · {s['threads']} threads", style=C_LABEL)
     console.print(RPanel(head, border_style="#1e3a5f"))
@@ -1225,42 +1551,59 @@ def once(interval: float) -> None:
     def p(title, body):
         return RPanel(body, title=title, border_style="#1e3a5f", title_align="left")
 
-    console.print(Columns([p("CPU", render_cpu(s, 44)), p("MEMORY", render_mem(s, 44))],
-                          equal=True))
-    console.print(Columns([p("DISK · I/O", render_disk(s, 44)),
-                           p("NETWORK", render_net(s, 44))], equal=True))
-    console.print(Columns([p("THERMAL · CLOCK · POWER", render_pi(s, 44)),
-                           p("HISTORY", render_hist(s, col, 44))], equal=True))
+    inner = max(30, width // 2 - 8)
+    pairs = [
+        ("CPU", render_cpu(s, inner), "MEMORY", render_mem(s, inner)),
+        ("DISK · I/O", render_disk(s, inner), "NETWORK", render_net(s, inner)),
+        ("THERMAL · CLOCK · POWER", render_pi(s, inner), "HISTORY", render_hist(s, col, inner)),
+    ]
+    for left, lbody, right, rbody in pairs:
+        console.print(Columns([p(left, lbody), p(right, rbody)], equal=True))
 
-    width = 100
-    cmd_w = max(20, width - 62)
-    table = Text()
-    table.append(
-        f"{'PID':>6} {'USER':<9}{'CPU%':>6}{'MEM%':>6}{'RSS':>7} {'THR':>3} "
-        f"{'STATE':<9}{'TIME+':>7}  COMMAND\n", style=C_TITLE)
+    tbl_w = max(40, width - 4)         # the panel border eats two cells each side
+    cols, cmd_w = pick_cols(tbl_w)
+    table = proc_header(cols, cmd_w)
     for r in sorted(s["procs"], key=lambda r: r["cpu"], reverse=True)[:10]:
-        table.append(
-            f"{r['pid']:>6} {r['user']:<9}{r['cpu']:>6.1f}{r['mem']:>6.1f}"
-            f"{human_bytes(r['rss']):>7} {r['threads']:>3} "
-            f"{r['state']:<9}{fmt_cpu_time(r['cputime']):>7}  {col.cmdline(r['pid'])[:cmd_w]}\n",
-            style=C_VAL,
-        )
+        table.append("\n")
+        table.append_text(proc_row(r, cols, cmd_w, col.cmdline(r["pid"])))
     console.print(p("TOP PROCESSES (by CPU)", table))
-    console.print(Text(f"sampled {time.strftime('%Y-%m-%d %H:%M:%S')} "
-                       f"· interval {max(0.2, interval):g}s", style=C_DIM))
+    console.print(Text(
+        f"sampled {time.strftime('%Y-%m-%d %H:%M:%S')} · interval {max(0.2, interval):g}s"
+        f" · pistat {__version__}", style=C_DIM))
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="pistat — real-time TUI system dashboard")
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="pistat",
+        description="pistat — real-time TUI system dashboard (Raspberry Pi friendly)",
+        epilog="Keys in the TUI: q quit · p pause · s sort · S reverse · 1/2/5 interval "
+               "· r reset peaks · / filter · j/k move · PgUp/PgDn · Home/End",
+    )
     ap.add_argument("-i", "--interval", type=float, default=1.0,
-                    help="sampling interval in seconds (default 1.0)")
-    ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
-    args = ap.parse_args()
-    if args.once:
-        once(args.interval)
-        return
-    PistatApp(interval=args.interval).run()
+                    help=f"sampling interval in seconds (default 1.0, minimum {MIN_INTERVAL:.1f})")
+    ap.add_argument("--once", action="store_true",
+                    help="print one plain-text snapshot and exit")
+    ap.add_argument("--json", action="store_true",
+                    help="print one snapshot as JSON and exit (implies --once)")
+    ap.add_argument("-w", "--width", type=int, default=None,
+                    help="output width for --once/--json (default: terminal width)")
+    ap.add_argument("-V", "--version", action="version", version=f"pistat {__version__}")
+    args = ap.parse_args(argv)
+
+    interval = max(MIN_INTERVAL, args.interval)
+    if interval != args.interval:
+        print(f"pistat: interval raised to the {MIN_INTERVAL:g}s minimum", file=sys.stderr)
+
+    try:
+        if args.once or args.json:
+            once(interval, term_width(args.width), as_json=args.json)
+        else:
+            PistatApp(interval=interval).run()
+    except KeyboardInterrupt:
+        return 130
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
+

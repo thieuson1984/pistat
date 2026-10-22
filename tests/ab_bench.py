@@ -2,7 +2,7 @@
 import sys
 
 sys.path.insert(0, "/home/kempi/pistat")
-import pistat  # noqa: E402
+import pistat
 
 mode = sys.argv[1] if len(sys.argv) > 1 else "all"
 

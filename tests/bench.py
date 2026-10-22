@@ -4,7 +4,7 @@ import sys
 import time
 
 sys.path.insert(0, "/home/kempi/pistat")
-import pistat  # noqa: E402
+import pistat
 
 stats = {"sample": 0.0, "procs": 0.0, "render_all": 0.0, "n": 0}
 
@@ -41,7 +41,7 @@ pistat.PistatApp.render_all = timed_render
 
 async def main() -> None:
     app = pistat.PistatApp(interval=1.0)
-    async with app.run_test(size=(120, 44)) as pilot:
+    async with app.run_test(size=(120, 44)):
         await asyncio.sleep(1.2)
         stats.update(sample=0.0, procs=0.0, render_all=0.0, n=0)
         await asyncio.sleep(10)
