@@ -50,6 +50,13 @@ Options:
 
 Environment: PISTAT_PREFIX, PISTAT_REF, PISTAT_REPO, PISTAT_PYTHON, NO_COLOR
 
+If the repository is private, give the script a token (it is used for the
+script's own downloads too):
+
+  export GITHUB_TOKEN=\$(gh auth token)
+  curl -fsSL -H "Authorization: token \$GITHUB_TOKEN" \\
+    https://raw.githubusercontent.com/$REPO/$REF/install.sh | bash
+
 Installs:
   <prefix>/lib/pistat/pistat.py          the dashboard (single file)
   <prefix>/lib/pistat/venv               private venv, only if deps are missing
@@ -96,14 +103,35 @@ if [ "$ACTION" = "uninstall" ]; then
 fi
 
 # ------------------------------------------------------------------ helpers ---
-fetch() {   # fetch URL DEST
+fetch() {   # fetch URL DEST  (falls back to a token for private repos)
+  local url="$1" dest="$2" tok=""
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 3 --connect-timeout 15 "$1" -o "$2"
+    if curl -fsSL --retry 3 --connect-timeout 15 "$url" -o "$dest" 2>/dev/null; then
+      return 0
+    fi
+    tok="$(github_token || true)"
+    [ -n "$tok" ] || return 1
+    curl -fsSL --retry 3 --connect-timeout 15 \
+         -H "Authorization: token $tok" "$url" -o "$dest"
   elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "$2" "$1"
+    if wget -q -O "$dest" "$url" 2>/dev/null; then
+      return 0
+    fi
+    tok="$(github_token || true)"
+    [ -n "$tok" ] || return 1
+    wget -q -O "$dest" --header="Authorization: token $tok" "$url"
   else
     die "need curl or wget on PATH"
   fi
+}
+
+github_token() {   # $GITHUB_TOKEN / $GH_TOKEN / gh auth token, whichever exists
+  if [ -n "${GITHUB_TOKEN:-}" ]; then printf '%s' "$GITHUB_TOKEN"; return 0; fi
+  if [ -n "${GH_TOKEN:-}" ]; then printf '%s' "$GH_TOKEN"; return 0; fi
+  if command -v gh >/dev/null 2>&1; then
+    gh auth token 2>/dev/null && return 0
+  fi
+  return 1
 }
 
 pick_python() {
