@@ -1,6 +1,7 @@
 """Exercise pistat's key bindings, filter and list navigation.
 
-Exits non-zero on the first failed assertion, so it doubles as a smoke test.
+Runs under pytest (see conftest.py) and standalone; the first failed
+assertion ends the run, so it doubles as a smoke test.
 """
 import asyncio
 import os
@@ -17,7 +18,7 @@ os.environ["PISTAT_CONFIG_DIR"] = tempfile.mkdtemp(prefix="pistat-test-cfg-")
 from pistat import PistatApp
 
 
-async def main() -> None:
+async def test_key_flow() -> None:
     app = PistatApp(interval=0.3)
     async with app.run_test(size=(120, 44)) as pilot:
         await asyncio.sleep(1.4)
@@ -97,4 +98,4 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(test_key_flow())

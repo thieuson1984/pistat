@@ -60,12 +60,12 @@ Runtime: Python ≥ 3.9, `textual ≥ 0.47`, `rich ≥ 13`, `psutil ≥ 5.9`, Li
 
 | Panel | Contents |
 |---|---|
-| CPU | load average, governor, current clock, session peak, overall + per-core usage bars, per-core clock |
-| THERMAL · CLOCK · POWER | SoC (`cpu-thermal`) and PMIC temperature, session peak, headroom to the 80 °C soft limit, decoded `vcgencmd get_throttled` flags (under-voltage / freq cap / throttle / soft limit, now and "seen"), the latched `rpi_volt` under-voltage alarm, arm/core/v3d clocks, core voltage, fan tachometer if one is exposed, board revision, uptime |
+| CPU | load average, governor, **live clock** with % of the governor ceiling and a 150-sample sparkline, session peak, overall + per-core usage bars, per-core clock |
+| THERMAL · CLOCK · POWER | SoC (`cpu-thermal`) and PMIC temperature, session peak, headroom to the 80 °C soft limit, decoded `vcgencmd get_throttled` state split into **now** vs **seen since boot**, the latched `rpi_volt` under-voltage alarm, live ARM clock + % of max, core/v3d clocks, core rail voltage to 10 µV with a change arrow, SDRAM rail, fan tachometer if one is exposed, board revision, uptime |
 | MEMORY · PROCESSES | RAM and swap bars + absolute values, live swap in/out **rates**, free/cached, process and thread counts, peak usage, process state histogram (running / sleeping / idle / zombie …) |
 | DISK · I/O | per-mount usage (/, /boot/firmware …), live read/write rates, cumulative I/O, free space, `+N mounts` when more are hidden |
 | NETWORK | per-interface link state + IPv4, live up/down rates, cumulative totals, aggregate, `+N ifaces` when hidden |
-| HISTORY | 150-sample sparklines for CPU %, SoC temperature, load, network throughput and process count, plus uptime |
+| HISTORY | 150-sample sparklines for CPU %, SoC temperature, **clock**, **core voltage**, load and network throughput, plus uptime |
 
 The bottom panel is a sortable, scrollable process table: PID, user, nice,
 CPU %, memory %, RSS, threads, state, CPU time, full command line. Columns are
@@ -84,6 +84,37 @@ signalling another user's process needs the matching privilege (root), which
 the notification will tell you.
 
 `--once` prints the same panels plus the top 10 processes by CPU.
+
+## Real-time clock and voltage
+
+The clock and the core voltage are the two numbers that show whether the
+governor is actually doing anything, so both are refreshed on the sampling tick
+rather than behind a cache:
+
+| Signal | Source | Cost | Refresh |
+|---|---|---|---|
+| ARM clock, per core | `/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq` | ≈30 µs for all 4 cores | every tick |
+| Governor limits | `policy0/{scaling_min,scaling_max}_freq`, `scaling_governor` | 4 small reads | 10 s |
+| Core voltage | `vcgencmd measure_volts core` | ≈2 ms (one fork) | 1.5 s |
+| SDRAM rails | `vcgencmd measure_volts sdram_{c,i,p}` | ≈2 ms each | 30 s |
+| core / v3d / emmc clock | `vcgencmd measure_clock` | ≈2 ms each | 5 s |
+| Throttle state | `vcgencmd get_throttled` | ≈2 ms | 1 s |
+| PMIC temperature | `vcgencmd measure_temp pmic` | ≈2.3 ms | 2.5 s |
+
+`vcgencmd measure_clock arm` forks a process for a number sysfs already has, so
+it is gone: the firmware's ARM figure is only a fallback for kernels without
+`cpufreq`. Everything the firmware *must* answer is sampled on its own TTL, so
+the dashboard costs less than it did while updating the clock 1–10× faster.
+
+The panels show the session envelope, not just the instant: `clock 1.800GHz
+100% ████` with a sparkline pinned to the 600 MHz–1.8 GHz governor range, and
+`volt core 0.9285V↑` where the arrow marks a rail change since the last read.
+`r` resets the peak/floor/dvfs-step counters.
+
+Throttle bits 0–3 mean *now* and are red; bits 16–19 — and the `rpi_volt`
+latched alarm, which also survives reboots — are reported as `OK now · seen:
+under-voltage seen`. Treating those as a live fault (the old behaviour) painted
+the panel red for the rest of the uptime after a single brown-out at boot.
 
 ## Keys
 
@@ -126,17 +157,27 @@ whole window.
 ```json
 {
   "host": "pi.kapp.vn", "board": "Raspberry Pi 4 Model B Rev 1.2",
-  "pistat": "1.2.1", "time": "2026-10-23T00:45:32+0700", "uptime_s": 4821.1,
+  "pistat": "1.3.0", "time": "2026-10-23T00:45:32+0700", "uptime_s": 4821.1,
   "cpu":    {"total_pct": 11.6, "per_core_pct": [2.9, 6.1, 28.6, 8.8],
              "per_core_mhz": [1800, 1800, 1800, 1800], "load": [1.41, 1.06, 0.68],
-             "governor": "ondemand", "peak_pct": 25.0},
+             "governor": "ondemand", "peak_pct": 25.0, "clock_hz": 1800000000,
+             "clock": {"current_mhz": 1800.0, "peak_mhz": 1800.0, "floor_mhz": 600.0,
+                       "core_min_mhz": 1800.0, "core_max_mhz": 1800.0, "spread_mhz": 0.0,
+                       "limit_min_mhz": 600.0, "limit_max_mhz": 1800.0,
+                       "pct_of_max": 100.0, "dvfs_steps": 12, "governor": "ondemand"}},
   "memory": {"used": 1230643200, "total": 3979075584, "available": 2748432384,
              "cached": 2127085568, "percent": 30.9, "peak_percent": 30.9},
   "swap":   {"used": 0, "total": 5867823104, "percent": 0.0,
              "in_bps": 0.0, "out_bps": 0.0},
-  "thermal":{"soc_c": 51.1, "peak_c": 51.1, "sensors_c": {"cpu-thermal": 51.1, "pmic": 52.4},
+  "thermal":{ "soc_c": 51.1, "peak_c": 51.1, "sensors_c": {"cpu-thermal": 51.1, "pmic": 52.4},
              "fans_rpm": {}, "throttled_hex": "0x0", "throttle_flags": [],
-             "core_volts": 0.935, "clocks_hz": {"arm": 1800000000}},
+             "core_volts": 0.9285,
+             "clocks_hz": {"core": 500000992, "v3d": 500000992,
+                            "emmc": 250000496, "arm": 1800000000}},
+  "power":  {"core_volts": 0.9285, "core_volts_min": 0.85, "core_volts_max": 0.9285,
+             "rails_volts": {"sdram_c": 1.1, "sdram_i": 1.1, "sdram_p": 1.1},
+             "throttled_hex": "0x0", "throttle_now": [], "throttle_seen": [],
+             "under_voltage_now": false, "under_voltage_seen": false},
   "disk":   {"mounts": ["…"], "io_read_bps": 0.0, "io_write_bps": 0.0,
              "io_read_total": 2147483648, "io_write_total": 687865856},
   "network":{"interfaces": ["…"], "rx_bps": 392.0, "tx_bps": 985.0},
@@ -148,7 +189,11 @@ whole window.
 ```
 
 Every block is present even when a sensor is missing (`null`, `{}` or `0`), so a
-consumer never has to guess. Example cron entry:
+consumer never has to guess. `cpu.clock` and `power` are the fields to watch for
+DVFS and brown-out evidence: `floor_mhz` is the lowest average clock seen this
+run, `dvfs_steps` counts governor transitions, and `under_voltage_seen` is the
+firmware's latched bit (once true it stays true until reboot). Example cron
+entry:
 
 ```cron
 * * * * * /home/pi/.local/bin/pistat --json > /var/lib/node_exporter/textfile/pistat.json.tmp && mv …
@@ -181,8 +226,11 @@ slate palette.
   vs ≈80 ms through psutil's per-process API) and caches UID / username /
   command line per PID, invalidating them when a PID is recycled. Command lines
   are fetched lazily, only for rows that are actually drawn.
-- **`vcgencmd` is cached** for 2.5 s — each call forks a process, and clock,
-  voltage and throttle state change slowly.
+- **`vcgencmd` is cached per sensor group, not in one block** — each call forks
+  a process (≈2–3 ms). Throttle state is 1 s, core voltage 1.5 s, PMIC
+  temperature 2.5 s, core/v3d/emmc clocks 5 s, SDRAM rails 30 s. The ARM clock
+  needs no fork at all: `scaling_cur_freq` is ~30 µs for all four cores and is
+  read on every tick.
 - **Swap and disk rates are deltas**, not psutil's cumulative counters
   (`swap_memory().sin` is bytes since boot, not a rate).
 - **Uptime** comes from `/proc/uptime` (exact, free); `boot_time()` is the
@@ -194,8 +242,8 @@ slate palette.
   tool stays quiet on an idle box — and a bar crossing a colour threshold still
   repaints.
 - **Failing sensors never kill the UI**: every optional source (temps, disks,
-  I/O, network, `vcgencmd`, `psutil.cpu_freq`) is individually guarded and
-  degrades to `n/a`.
+  I/O, network, `vcgencmd`, `cpufreq`) is individually guarded and degrades to
+  `n/a` — the clock block even survives a missing `sysfs` by returning zeros.
 - **Theming**: no panel hard-codes a colour. `palette_from_theme()` maps the
   active Textual theme onto eleven colour roles, `watch_theme()` re-derives them
   and repaints, and the CSS speaks only theme variables — so chrome and body
@@ -204,27 +252,41 @@ slate palette.
   light and dark themes without any contrast arithmetic.
 - **Signals are always confirmed** through a modal that names the pid, user and
   signal; `x`/`X` never fire directly. PID 1 and pistat's own pid are refused.
-- Measured on this Pi 4 at 120 × 44: **≈11 % of one core (≈3 % of the whole
-  machine)** at the 1 s default, ≈8 % at `-i 2`. For comparison `htop` runs at
-  ≈2 % of a core.
+- Measured on this Pi 4 at 120 × 44: **≈12.5 % of one core (≈3 % of the whole
+  machine)** at the 1 s default — the three extra live sparklines cost ~0.5 pp
+  over 1.2.1 while the collector itself dropped from ~24 ms to ~22 ms per
+  sample. For comparison `htop` runs at ≈2 % of a core.
 - No writes: everything is read-only except the terminal and the theme
   preference file.
 
 ## Tests
 
-They are plain scripts, no framework, and they exit non-zero on the first
-failure. Run them from anywhere:
+`pytest` is the way in — 39 checks, no plugins required (`tests/conftest.py`
+runs the `async def` tests, so the suite works on a bare interpreter):
 
 ```sh
-python3 tests/test_layout.py     # every terminal size: list visible, nothing clipped
-python3 tests/test_keys.py       # bindings, sort cycle, filter, navigation
-python3 tests/test_features.py   # theme switching + persistence, header sorting, kill
-python3 tests/test_cli.py        # --version/--json/--once/-w/--themes, interval clamp, no ANSI in a pipe
-python3 tests/test_headless.py   # full app render → screenshot.svg
-python3 tests/probe.py           # sizes/regions/classes at one or many sizes
+pip install -r requirements-dev.txt   # pytest (+ pyte for the PTY harness)
+python3 -m pytest tests/ -q
+```
+
+| File | Covers |
+|---|---|
+| `test_layout.py` | 11 terminal sizes: list visible, grid shape, nothing clipped |
+| `test_keys.py` | bindings, sort cycle, filter, navigation |
+| `test_features.py` | theme switching + persistence, header sorting, kill dialogs |
+| `test_cli.py` | `--version/--json/--once/-w/--themes`, interval clamp, no ANSI in a pipe |
+| `test_telemetry.py` | clock block, volts/rails, throttle now-vs-seen, renderers, JSON |
+
+Each file also runs standalone (`python3 tests/test_layout.py`), and the
+harnesses below stay scripts on purpose — they print numbers, they do not
+assert:
+
+```sh
+python3 tests/headless_probe.py         # full app render → screenshot.svg
+python3 tests/probe.py                  # sizes/regions/classes at one or many sizes
 python3 tests/pty_capture.py 100 30 3   # real PTY screen dump (needs pyte)
-python3 tests/measure_cpu.py 12        # pistat's own CPU in a PTY
-python3 tests/bench.py                 # sampling vs render timing
+python3 tests/measure_cpu.py 12         # pistat's own CPU in a PTY
+python3 tests/bench.py                  # sampling vs render timing
 python3 tests/ab_bench.py [panels|procs|frozen]   # A/B harness for repaint cost
 ```
 
@@ -234,13 +296,16 @@ python3 tests/ab_bench.py [panels|procs|frozen]   # A/B harness for repaint cost
 pistat.py          the whole application (~1 500 lines)
 install.sh         one-shot installer / updater / uninstaller
 requirements.txt   textual, rich, psutil
+requirements-dev.txt  pytest (+ pyte for the PTY harness)
 screenshot.svg     last headless render (Textual SVG export)
-tests/             development harnesses and regression suites
+tests/             pytest suite (39 checks) + development harnesses
+  conftest.py        runs the async tests without pytest-asyncio
   test_layout.py     responsive layout + clipping regression
   test_keys.py       key bindings / filter / navigation
   test_features.py   theme switching + persistence, header sorting, kill signals
   test_cli.py        CLI contract (flags, JSON, width, clamping)
-  test_headless.py   headless render, writes screenshot.svg
+  test_telemetry.py  clock / voltage / throttle / renderer / JSON-schema tests
+  headless_probe.py  headless render, writes screenshot.svg
   probe.py           layout probe (sizes, regions, classes)
   pty_capture.py     run in a real PTY at a fixed size, dump the screen (pyte)
   measure_cpu.py     measure pistat's own CPU in a PTY
@@ -252,5 +317,6 @@ tests/             development harnesses and regression suites
 
 On a normal x86 box `vcgencmd` is absent and `/proc/device-tree/model` does not
 exist: the thermal panel degrades to the hwmon/thermal zones it can find, the
-clock/voltage/throttle lines show `n/a`, and the board line says
-`unknown board`. Everything else works unchanged.
+voltage/throttle lines show `n/a`, and the board line says `unknown board`. The
+clock still works — it comes from `cpufreq`, which every Linux box has — and
+`pct_of_max` follows that machine's own ceiling. Everything else is unchanged.

@@ -62,6 +62,17 @@ def test_json() -> None:
     assert data["cpu"]["per_core_pct"], "no per-core data"
     assert data["memory"]["total"] > 0
     assert data["thermal"]["soc_c"] is None or data["thermal"]["soc_c"] > 0
+    # clock and power blocks are part of the contract, not an afterthought
+    clock = data["cpu"]["clock"]
+    for key in ("current_mhz", "peak_mhz", "floor_mhz", "limit_max_mhz",
+                "pct_of_max", "dvfs_steps", "governor"):
+        assert key in clock, key
+    assert isinstance(data["cpu"]["clock_hz"], int)
+    power = data["power"]
+    for key in ("core_volts", "rails_volts", "throttle_now", "throttle_seen",
+                "under_voltage_now", "under_voltage_seen"):
+        assert key in power, key
+    assert isinstance(power["throttle_now"], list)
 
 
 def test_once_width() -> None:

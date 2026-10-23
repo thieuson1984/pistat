@@ -83,9 +83,15 @@ async def check(cols: int, rows: int) -> str:
         return label
 
 
-async def main() -> None:
+async def test_layout_sizes() -> None:
+    """Every supported terminal size keeps the list on screen and text clipped."""
     for cols, rows in SIZES:
-        print("ok", await check(cols, rows))
+        label = await check(cols, rows)
+        print("ok", label)
+
+
+async def main() -> None:
+    await test_layout_sizes()
 
 
 if __name__ == "__main__":

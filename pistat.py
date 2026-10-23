@@ -44,7 +44,7 @@ from textual.screen import ModalScreen
 from textual.theme import BUILTIN_THEMES, Theme
 from textual.widgets import Footer, Header, Input, Static
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 MIN_INTERVAL = 0.1          # below this a 1 s timer would busy-loop the CPU
 DEFAULT_WIDTH = 100         # --once fallback width when stdout is a pipe
@@ -323,8 +323,14 @@ def bar(pct: float, width: int, color: str | None = None) -> Text:
     return t
 
 
-def sparkline(values, width: int, color: str | None = None) -> Text:
-    """Fixed-width block sparkline, scaled to its own peak."""
+def sparkline(values, width: int, color: str | None = None,
+              lo: float | None = None, hi: float | None = None) -> Text:
+    """Fixed-width block sparkline.
+
+    Self-scaled to its own peak by default (right for percentages). Pass `lo`
+    and `hi` to pin the scale — a clock sparkline must show 600 MHz near the
+    bottom and 1.8 GHz at the top, not "flat because nothing changed".
+    """
     width = max(0, width)
     color = color or C_ACCENT
     t = Text()
@@ -332,10 +338,14 @@ def sparkline(values, width: int, color: str | None = None) -> Text:
     pad = width - len(vals)
     if pad > 0:
         t.append(SPARK[0] * pad, style=C_TRACK)
-    peak = max(vals) if vals else 1.0
-    peak = peak if peak > 0 else 1.0
+    if lo is not None and hi is not None and hi > lo:
+        span, base = hi - lo, lo
+    else:
+        span = max(vals) if vals else 1.0
+        span = span if span > 0 else 1.0
+        base = 0.0
     for v in vals:
-        ratio = max(0.0, v) / peak
+        ratio = max(0.0, min(1.0, (v - base) / span))
         idx = min(len(SPARK) - 1, int(ratio * (len(SPARK) - 1)))
         t.append(SPARK[idx], style=color if ratio > 0.5 else C_DIM)
     return t
@@ -428,15 +438,25 @@ def parse_vcg(out: str | None) -> float | None:
         return None
 
 
-def decode_throttled(raw: str | None) -> tuple[bool, list[str], str]:
+def decode_throttle(raw: str | None) -> dict:
+    """Split `get_throttled` into live faults and bits latched since boot.
+
+    Bits 0-3 describe what is happening *now*; 16-19 are sticky until the next
+    reboot. Conflating them made a single brown-out during boot look like a
+    permanent under-voltage, so they are returned separately.
+    """
     if not raw or "=" not in raw:
-        return False, [], raw or "n/a"
+        return {"now": [], "seen": [], "raw": raw or "n/a", "value": 0}
     try:
         val = int(raw.split("=", 1)[1], 16)
     except ValueError:
-        return False, [], raw
-    flags = [name for bit, name in THROTTLE_BITS if val & (1 << bit)]
-    return val == 0, flags, f"0x{val:x}"
+        return {"now": [], "seen": [], "raw": raw, "value": 0}
+    return {
+        "now": [name for bit, name in THROTTLE_BITS if bit < 16 and val & (1 << bit)],
+        "seen": [name for bit, name in THROTTLE_BITS if bit >= 16 and val & (1 << bit)],
+        "raw": f"0x{val:x}",
+        "value": val,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -462,15 +482,38 @@ class Collector:
         self._cmdlines: dict[int, str] = {}
         self._pi_cache: dict = {}
         self._pi_ts: float = 0.0
+        # cached firmware queries — one TTL per sensor group (see _pi_block)
+        self._fw_clock_cache: dict[str, float] = {}
+        self._fw_ts: float = 0.0
+        self._volts: dict = {}
+        self._volts_ts: float = 0.0
+        self._rails: dict[str, float] = {}
+        self._rails_ts: float = 0.0
+        self._throttle: dict = {}
+        self._throttle_ts: float = 0.0
+        self._pmic: float | None = None
+        self._pmic_ts: float = 0.0
+        self._limits: dict = {}
+        self._limits_ts: float = 0.0
         self._io_totals: tuple[float, float] = (0.0, 0.0)
         self.cpu_hist: deque[float] = deque(maxlen=history)
         self.temp_hist: deque[float] = deque(maxlen=history)
         self.load_hist: deque[float] = deque(maxlen=history)
         self.net_hist: deque[float] = deque(maxlen=history)
         self.procs_hist: deque[float] = deque(maxlen=history)
+        self.clock_hist: deque[float] = deque(maxlen=history)
+        self.volt_hist: deque[float] = deque(maxlen=history)
         self.peak_temp = 0.0
         self.peak_cpu = 0.0
         self.peak_mem = 0.0
+        # CPU clock (MHz) and core voltage are the two numbers worth tracking
+        # over time: together they show whether the governor is actually working
+        self.peak_clock = 0.0
+        self.min_clock = 0.0          # 0.0 = nothing sampled yet
+        self.dvfs_steps = 0           # observed clock-step changes this session
+        self._last_step_mhz = 0.0
+        self.volt_min: float | None = None
+        self.volt_max: float | None = None
         self.board = (read_text("/proc/device-tree/model") or "").replace("\x00", "")
         self.ncpu = psutil.cpu_count(logical=True) or 1
         # prime the CPU deltas so the first sample is meaningful
@@ -517,7 +560,7 @@ class Collector:
                     temps[label or f"{name}/temp"] = int(raw) / 1000.0
         except OSError:
             pass
-        pmic = parse_vcg(vcgencmd("measure_temp pmic"))
+        pmic = self._pmic_temp()
         if pmic is not None:
             temps["pmic"] = pmic
         return temps
@@ -544,6 +587,15 @@ class Collector:
             freqs.append(int(raw) / 1000.0 if raw and raw.isdigit() else 0.0)
         return freqs
 
+    def _pmic_temp(self, ttl: float = 2.5) -> float | None:
+        """PMIC temperature via the firmware mailbox — 2.3 ms per fork, so TTL'd."""
+        now = time.monotonic()
+        if self._pmic_ts and now - self._pmic_ts < ttl:
+            return self._pmic
+        self._pmic = parse_vcg(vcgencmd("measure_temp pmic"))
+        self._pmic_ts = now
+        return self._pmic
+
     def _uv_alarm(self) -> bool:
         """rpi_volt hwmon latches an under-voltage alarm that survives reboots."""
         try:
@@ -554,29 +606,158 @@ class Collector:
             pass
         return False
 
-    def _pi_block(self, ttl: float = 2.5) -> dict:
-        """vcgencmd forks a process per call — refresh at most every `ttl` s."""
+    def _clock_limits(self, ttl: float = 10.0) -> dict:
+        """The governor's envelope (min/max/current policy) — sysfs, ~4 reads."""
         now = time.monotonic()
-        if self._pi_cache and now - self._pi_ts < ttl:
-            return self._pi_cache
-        ok, flags, raw = decode_throttled(vcgencmd("get_throttled"))
-        if self._uv_alarm():
-            flags = [*flags, "UV alarm latched (in0_lcrit)"]
-            ok = False
+        if self._limits and now - self._limits_ts < ttl:
+            return self._limits
+        base = "/sys/devices/system/cpu/cpufreq/policy0"
+        if not Path(base).exists():
+            base = "/sys/devices/system/cpu/cpu0/cpufreq"
+        lo = read_text(f"{base}/scaling_min_freq") or read_text(f"{base}/cpuinfo_min_freq")
+        hi = read_text(f"{base}/scaling_max_freq") or read_text(f"{base}/cpuinfo_max_freq")
+        self._limits = {
+            "min": int(lo) / 1000.0 if lo and lo.isdigit() else 0.0,
+            "max": int(hi) / 1000.0 if hi and hi.isdigit() else 0.0,
+            "governor": read_text(f"{base}/scaling_governor") or "n/a",
+        }
+        self._limits_ts = now
+        return self._limits
+
+    def _clock_block(self) -> dict:
+        """Live ARM clock from sysfs — the real-time number, refreshed every tick.
+
+        All four `scaling_cur_freq` reads together cost ~30 µs, so unlike
+        `vcgencmd measure_clock arm` (2-3 ms of fork) this can run at the
+        sampling rate without the dashboard costing more than it reports.
+        """
+        freqs = [f for f in self._core_freqs()]
+        live = [f for f in freqs if f > 0]
+        avg = sum(live) / len(live) if live else 0.0
+        if avg > 0:
+            if self.min_clock == 0.0 or avg < self.min_clock:
+                self.min_clock = avg
+            self.peak_clock = max(self.peak_clock, avg)
+            # a governor step is a change large enough to be a real DVFS edge,
+            # not float noise from the kHz → MHz conversion
+            if self._last_step_mhz and abs(avg - self._last_step_mhz) >= 1.0:
+                self.dvfs_steps += 1
+            self._last_step_mhz = avg
+        lim = self._clock_limits()
+        top = lim["max"] or 0.0
+        return {
+            "per_core_mhz": freqs,
+            "mhz": avg,
+            "peak_mhz": self.peak_clock,
+            "min_mhz": self.min_clock,
+            "core_max_mhz": max(live) if live else 0.0,
+            "core_min_mhz": min(live) if live else 0.0,
+            "spread_mhz": (max(live) - min(live)) if len(live) > 1 else 0.0,
+            "limit_min_mhz": lim["min"],
+            "limit_max_mhz": top,
+            "pct_of_max": (100.0 * avg / top) if top else 0.0,
+            "governor": lim["governor"],
+            "dvfs_steps": self.dvfs_steps,
+        }
+
+    def _volts_block(self, ttl: float = 1.5, rail_ttl: float = 30.0) -> dict:
+        """Core rail plus the SDRAM rails, straight from the firmware mailbox.
+
+        Core voltage moves with the DVFS step, so 1.5 s is fast enough to watch
+        it work while costing one fork per sample; the SDRAM rails are fixed
+        1.1 V on a Pi 4 and only need a slow refresh.
+        """
+        now = time.monotonic()
+        if self._volts and now - self._volts_ts < ttl:
+            return self._volts
+        prev = self._volts.get("core")
+        core = parse_vcg(vcgencmd("measure_volts core"))
+        if not self._rails or now - self._rails_ts >= rail_ttl:
+            for rail in ("sdram_c", "sdram_i", "sdram_p"):
+                v = parse_vcg(vcgencmd(f"measure_volts {rail}"))
+                if v:
+                    self._rails[rail] = v
+            self._rails_ts = now
+        if core is not None:
+            self.volt_min = core if self.volt_min is None else min(self.volt_min, core)
+            self.volt_max = core if self.volt_max is None else max(self.volt_max, core)
+        self._volts = {
+            "core": core,
+            "rails": dict(self._rails),
+            "delta": (core - prev) if (core is not None and prev is not None) else 0.0,
+            "min": self.volt_min,
+            "max": self.volt_max,
+        }
+        self._volts_ts = now
+        return self._volts
+
+    def _fw_clocks(self, ttl: float = 5.0) -> dict[str, float]:
+        """Firmware clocks that sysfs cannot report: core, v3d, emmc."""
+        now = time.monotonic()
+        if self._fw_clock_cache and now - self._fw_ts < ttl:
+            return self._fw_clock_cache
         clocks = {}
-        for name in ("arm", "core", "v3d"):
+        for name in ("core", "v3d", "emmc"):
             v = parse_vcg(vcgencmd(f"measure_clock {name}"))
             if v:
                 clocks[name] = v
-        self._pi_cache = {
-            "throttle_ok": ok,
-            "throttle_flags": flags,
-            "throttle_raw": raw,
-            "clocks": clocks,
-            "volts": parse_vcg(vcgencmd("measure_volts core")),
-            "governor": read_text("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),
+        if clocks or not self._fw_clock_cache:
+            self._fw_clock_cache = clocks
+        self._fw_ts = now
+        return self._fw_clock_cache
+
+    def _throttle_block(self, ttl: float = 1.0) -> dict:
+        """`get_throttled` decoded into *now* and *since boot* sets.
+
+        The firmware keeps the "seen" bits latched until reboot, so treating
+        them as a live fault painted the whole panel red forever after a single
+        brown-out. The panel now reports the current state separately.
+        """
+        now = time.monotonic()
+        if self._throttle and now - self._throttle_ts < ttl:
+            return self._throttle
+        thr = decode_throttle(vcgencmd("get_throttled"))
+        live = list(thr["now"])
+        seen = list(thr["seen"])
+        if self._uv_alarm():
+            # rpi_volt's alarm stays set until something clears it (a reboot or
+            # a root write) — evidence of a past brown-out, not a live fault
+            seen.append("UV alarm latched (rpi_volt)")
+        self._throttle = {
+            "now": live,
+            "seen": seen,
+            "ok": not live,
+            "raw": thr["raw"],
         }
-        self._pi_ts = now
+        self._throttle_ts = now
+        return self._throttle
+
+    def _pi_block(self, clock: dict | None = None) -> dict:
+        """All Pi telemetry, each group on its own refresh TTL.
+
+        vcgencmd forks a process per call (~2-3 ms), so only the sysfs parts —
+        the ARM clock and the latched UV alarm — are read on every tick.
+        """
+        clock = clock or self._clock_block()
+        volt = self._volts_block()
+        thr = self._throttle_block()
+        clocks = dict(self._fw_clocks())
+        if clock["mhz"]:
+            clocks["arm"] = clock["mhz"] * 1e6
+        self._pi_cache = {
+            "throttle_ok": thr["ok"],
+            "throttle_flags": [*thr["now"], *thr["seen"]],
+            "throttle_now": thr["now"],
+            "throttle_seen": thr["seen"],
+            "throttle_raw": thr["raw"],
+            "clocks": clocks,
+            "volts": volt["core"],
+            "rails": volt["rails"],
+            "volts_delta": volt["delta"],
+            "volts_min": volt["min"],
+            "volts_max": volt["max"],
+            "governor": clock["governor"],
+        }
         return self._pi_cache
 
     # -- processes -------------------------------------------------------- #
@@ -857,17 +1038,28 @@ class Collector:
             self.peak_temp = max(self.peak_temp, soc_temp)
 
         try:
-            freq = psutil.cpu_freq()
-        except (psutil.Error, NotImplementedError):
-            freq = None
+            clock = self._clock_block()
+        except (OSError, ValueError):
+            clock = {"per_core_mhz": [], "mhz": 0.0, "peak_mhz": 0.0, "min_mhz": 0.0,
+                     "core_max_mhz": 0.0, "core_min_mhz": 0.0, "spread_mhz": 0.0,
+                     "limit_min_mhz": 0.0, "limit_max_mhz": 0.0, "pct_of_max": 0.0,
+                     "governor": "n/a", "dvfs_steps": 0}
+        pi = self._pi_block(clock)
+        if clock["mhz"]:
+            self.clock_hist.append(clock["mhz"])
+        if pi["volts"] is not None:
+            self.volt_hist.append(pi["volts"])
         return {
             "ts": wall,
             "uptime": self._uptime(wall),
             "cpu_total": cpu_total,
             "per_core": per_core,
-            "core_freqs": self._core_freqs(),
+            "core_freqs": clock["per_core_mhz"],
             "load": load,
-            "freq": freq.current if freq else 0.0,
+            "freq": clock["mhz"],
+            "clock": clock,
+            "clock_hist": list(self.clock_hist),
+            "volt_hist": list(self.volt_hist),
             "mem": vm,
             "swap": sw,
             "swap_rate": self._swap_rate,
@@ -883,7 +1075,7 @@ class Collector:
             "procs": rows,
             "states": states,
             "threads": threads,
-            "pi": self._pi_block(),
+            "pi": pi,
             "board": self.board,
             "host": socket.gethostname(),
             "peak_cpu": self.peak_cpu,
@@ -913,33 +1105,54 @@ def render_cpu(s: dict, width: int = 46, height: int | None = None) -> Text:
     t = Text()
     bw = max(8, min(12, width - 20))
     load, gov = s["load"], s["pi"].get("governor") or "n/a"
-    clock = s["freq"] or max(s["core_freqs"] or [0]) or 0
+    ck = s.get("clock") or {}
+    mhz = ck.get("mhz") or s.get("freq") or 0.0
+    pct = ck.get("pct_of_max") or 0.0
 
     t.append("load   ", style=C_LABEL)
     t.append(f"{load[0]:.2f} {load[1]:.2f} {load[2]:.2f}", style=C_VAL)
-    t.append(f"  {gov}\n", style=C_DIM)
+    if width >= 31:
+        t.append(f"  {gov}", style=C_DIM)
+    t.append("\n")
 
+    # the ARM clock comes from sysfs every tick, so this line is real-time
+    # (the firmware's own number is a 2-3 ms fork and only used as a fallback)
     t.append("clock  ", style=C_LABEL)
-    t.append(f"{clock/1000:.2f}GHz" if clock else "n/a", style=C_ACCENT)
-    t.append(f"  peak {s['peak_cpu']:.0f}%   {len(s['per_core'])} cores\n", style=C_WARN)
+    if mhz:
+        t.append(f"{mhz/1000:.3f}GHz", style=C_ACCENT)
+        t.append(f" {pct:3.0f}%", style=C_DIM if pct < 99.5 else C_ACCENT)
+        spark_w = width - 22
+        if spark_w >= 8:
+            t.append(" ")
+            t.append_text(sparkline(
+                s.get("clock_hist") or [], spark_w, C_ACCENT,
+                lo=ck.get("limit_min_mhz") or 0.0,
+                hi=ck.get("limit_max_mhz") or 0.0,
+            ))
+    else:
+        t.append("n/a", style=C_DIM)
+    t.append("\n")
 
     total = s["cpu_total"]
     tc = usage_style(total)
     t.append("all    ", style=C_LABEL)
     t.append_text(bar(total, bw, tc))
-    t.append(f" {total:5.1f}%\n", style=tc)
+    t.append(f" {total:5.1f}%", style=tc)
+    if width >= 34:
+        t.append(f"  pk {s['peak_cpu']:.0f}%", style=C_WARN)
+    t.append("\n")
 
     cores = s["per_core"]
     # three header lines + one line per core; keep the "+N more" note visible
     room = len(cores) if height is None else max(1, height - 3)
     if len(cores) > room:
         room = max(1, room - 1)
-    for i, pct in enumerate(cores[:room]):
-        c = usage_style(pct)
+    for i, pct_core in enumerate(cores[:room]):
+        c = usage_style(pct_core)
         f = s["core_freqs"][i] if i < len(s["core_freqs"]) else 0
         t.append(f"cpu{i:<2}  ", style=C_LABEL)
-        t.append_text(bar(pct, bw, c))
-        t.append(f" {pct:5.1f}%", style=c)
+        t.append_text(bar(pct_core, bw, c))
+        t.append(f" {pct_core:5.1f}%", style=c)
         t.append(f" {f/1000:4.2f}G\n" if f else "\n", style=C_DIM)
     if len(cores) > room:
         t.append(f"… {len(cores) - room} more cores\n", style=C_DIM)
@@ -1064,55 +1277,84 @@ def render_pi(s: dict, width: int = 46) -> Text:
     t = Text()
     temp = s["soc_temp"]
     pmic = temps.get("pmic")
+    ck = s.get("clock") or {}
+    arm = ck.get("mhz") or (pi.get("clocks", {}).get("arm", 0.0) / 1e6)
+    pct = ck.get("pct_of_max") or 0.0
 
     t.append("soc    ", style=C_LABEL)
     t.append(f"{temp:5.1f}°C" if temp is not None else "  n/a ", style=temp_style(temp))
-    t.append("   pmic ", style=C_LABEL)
+    t.append("  pmic ", style=C_LABEL)
     t.append(f"{pmic:4.1f}°C\n" if pmic else " n/a \n", style=temp_style(pmic))
 
     t.append("peak   ", style=C_LABEL)
     t.append(f"{s['peak_temp']:5.1f}°C", style=C_WARN)
-    t.append("   up ", style=C_LABEL)
-    t.append(f"{fmt_uptime(s['uptime'])}\n", style=C_VAL)
-
-    t.append("flags  ", style=C_LABEL)
-    if pi["throttle_ok"]:
-        t.append("OK · no throttle\n", style=f"bold {C_OK}")
-    else:
-        t.append(" ".join(pi["throttle_flags"]) or pi["throttle_raw"], style=f"bold {C_BAD}")
-        t.append(f" {pi['throttle_raw']}\n", style=C_DIM)
-
-    cl = pi["clocks"]
-    t.append("clk    ", style=C_LABEL)
-    for k in ("arm", "core"):
-        if k in cl:
-            v = cl[k]
-            t.append(f"{k} ", style=C_DIM)
-            t.append(f"{v/1e9:.2f}G " if v >= 1e8 else f"{v/1e6:.0f}M ", style=C_VAL)
+    if width >= 28:
+        t.append("  head ", style=C_LABEL)
+        if temp is not None:
+            head = 80.0 - temp
+            t.append(f"{head:4.1f}°C",
+                     style=C_OK if head > 20 else (C_WARN if head > 8 else C_BAD))
+            if width >= 34:
+                t.append(" to 80°", style=C_DIM)
+        else:
+            t.append("n/a", style=C_DIM)
     t.append("\n")
 
-    t.append("       ", style=C_LABEL)
-    if "v3d" in cl:
-        t.append("v3d ", style=C_DIM)
-        t.append(f"{cl['v3d']/1e9:.2f}G  ", style=C_VAL)
-    t.append("volt ", style=C_DIM)
-    t.append(f"{pi['volts']:.3f}V" if pi["volts"] else "n/a", style=C_VAL)
+    # current state and "seen since boot" are different things: the firmware
+    # latches the *seen* bits until reboot, so they must not paint a live fault
+    t.append("flags  ", style=C_LABEL)
+    now_flags = pi.get("throttle_now") or []
+    seen_flags = pi.get("throttle_seen") or []
+    if now_flags:
+        t.append(" ".join(now_flags), style=f"bold {C_BAD}")
+    elif seen_flags:
+        t.append("OK now", style=f"bold {C_OK}")
+        t.append(f" · seen: {', '.join(seen_flags)}", style=C_WARN)
+    else:
+        t.append("OK · no throttle", style=f"bold {C_OK}")
+    if str(pi.get("throttle_raw") or "").startswith("0x"):
+        t.append(f" {pi['throttle_raw']}", style=C_DIM)
+    t.append("\n")
+
+    t.append("clk    ", style=C_LABEL)
+    t.append(f"arm {arm/1000:.3f}G", style=C_ACCENT)
+    t.append(f" {pct:3.0f}%\n", style=C_DIM if pct < 99.5 else C_ACCENT)
+
+    cl = pi.get("clocks") or {}
+    fw = [k for k in ("core", "v3d") if k in cl]
+    if fw:
+        t.append("       ", style=C_LABEL)
+        for key in fw:
+            t.append(f"{key} ", style=C_DIM)
+            t.append(f"{cl[key]/1e9:.3f}G " if cl[key] >= 1e8 else f"{cl[key]/1e6:.0f}M ",
+                     style=C_VAL)
+        t.append("\n")
+
+    # 4 decimals: the firmware reports the core rail in 25 mV steps and the
+    # third-decimal rounding hid the difference between DVFS states
+    rails = pi.get("rails") or {}
+    t.append("volt   ", style=C_LABEL)
+    if pi.get("volts"):
+        t.append(f"core {pi['volts']:.4f}V", style=C_VAL)
+        delta = pi.get("volts_delta") or 0.0
+        if abs(delta) >= 0.0005:
+            t.append("↑" if delta > 0 else "↓", style=C_WARN if delta < 0 else C_ACCENT)
+        if "sdram_c" in rails and width >= 34:
+            t.append(f" sdram {rails['sdram_c']:.3f}V", style=C_DIM)
+    else:
+        t.append("n/a", style=C_DIM)
     fans = s.get("fans") or {}
-    if fans:
-        t.append("  fan ", style=C_LABEL)
-        t.append(f"{max(fans.values())}rpm", style=C_VAL)
+    if fans and width >= 44:
+        t.append(f"  fan {max(fans.values())}rpm", style=C_VAL)
     t.append("\n")
 
     t.append("board  ", style=C_LABEL)
-    t.append(short_board(s["board"])[:24] + "\n", style=C_DIM)
-
-    t.append("head   ", style=C_LABEL)
-    if temp is not None:
-        head = 80.0 - temp
-        t.append(f"{head:4.1f}°C", style=C_OK if head > 20 else (C_WARN if head > 8 else C_BAD))
-        t.append(" to 80°C soft limit", style=C_DIM)
+    if width >= 34:
+        t.append(short_board(s["board"])[:20], style=C_DIM)
+        t.append(f"  up {fmt_uptime(s['uptime'])}", style=C_LABEL)
     else:
-        t.append("n/a", style=C_DIM)
+        t.append(short_board(s["board"])[:max(4, width - 7)], style=C_DIM)
+    t.append("\n")
     return t
 
 
@@ -1125,15 +1367,28 @@ def render_hist(s: dict, c: Collector, width: int = 46) -> Text:
     t.append("temp  ", style=C_LABEL)
     t.append_text(sparkline(c.temp_hist, w, C_HOT))
     t.append(f" {(s['soc_temp'] or 0):4.1f}°\n", style=C_HOT)
+    # clock and core voltage are the two live signals that show the governor
+    # working — both are cheap enough to sample at the full tick rate
+    clock = s.get("clock") or {}
+    t.append("clk   ", style=C_LABEL)
+    t.append_text(sparkline(
+        s.get("clock_hist") or c.clock_hist, w, C_ACCENT,
+        lo=clock.get("limit_min_mhz") or 0.0,
+        hi=clock.get("limit_max_mhz") or 0.0,
+    ))
+    mhz = clock.get("mhz") or 0.0
+    t.append(f"{mhz/1000:5.2f}G\n" if mhz else "  n/a\n", style=C_ACCENT)
+    t.append("volt  ", style=C_LABEL)
+    t.append_text(sparkline(s.get("volt_hist") or c.volt_hist, w, C_WARN,
+                            lo=0.75, hi=1.15))
+    volts = s.get("pi", {}).get("volts")
+    t.append(f" {volts:5.3f}V\n" if volts else "  n/a\n", style=C_WARN)
     t.append("load  ", style=C_LABEL)
     t.append_text(sparkline(c.load_hist, w, C_OK))
     t.append(f" {s['load'][0]:4.2f}\n", style=C_OK)
     t.append("net   ", style=C_LABEL)
     t.append_text(sparkline(c.net_hist, w, C_WARN))
     t.append(f" {human_rate(sum(n['rx']+n['tx'] for n in s['nets'])):>7}\n", style=C_WARN)
-    t.append("procs ", style=C_LABEL)
-    t.append_text(sparkline(c.procs_hist, w, C_MAGENTA))
-    t.append(f" {len(s['procs']):>7}\n", style=C_MAGENTA)
     t.append("uptime ", style=C_LABEL)
     t.append(f"{fmt_uptime(s['uptime'])}", style=C_VAL)
     t.append("  sampled ", style=C_LABEL)
@@ -1627,7 +1882,13 @@ class PistatApp(App):
     def action_reset_peaks(self) -> None:
         c = self.collector
         c.peak_cpu = c.peak_mem = c.peak_temp = 0.0
+        c.peak_clock = c.min_clock = 0.0
+        c.dvfs_steps = 0
+        c.volt_min = c.volt_max = None
+        c.procs_hist.clear()
         self.notify("peaks reset", timeout=1.5)
+        if self.last:
+            self.render_all(self.last)
 
     # -- signals ---------------------------------------------------------- #
     def _selected_row(self) -> dict | None:
@@ -1822,6 +2083,44 @@ def term_width(explicit: int | None = None) -> int:
     return max(40, min(240, cols))
 
 
+def _clock_json(ck: dict) -> dict:
+    """Stable JSON view of the live clock block (`null` when sysfs is missing)."""
+    def mhz(key: str) -> float | None:
+        v = ck.get(key)
+        return None if v is None else round(float(v), 1)
+
+    return {
+        "current_mhz": mhz("mhz"),
+        "peak_mhz": mhz("peak_mhz"),
+        "floor_mhz": mhz("min_mhz"),
+        "core_min_mhz": mhz("core_min_mhz"),
+        "core_max_mhz": mhz("core_max_mhz"),
+        "spread_mhz": mhz("spread_mhz"),
+        "limit_min_mhz": mhz("limit_min_mhz"),
+        "limit_max_mhz": mhz("limit_max_mhz"),
+        "pct_of_max": round(float(ck.get("pct_of_max") or 0.0), 1),
+        "dvfs_steps": int(ck.get("dvfs_steps") or 0),
+        "governor": ck.get("governor") or None,
+    }
+
+
+def _power_json(s: dict) -> dict:
+    """Volts + throttle state: the brown-out evidence, in one block."""
+    pi = s.get("pi") or {}
+    rails = pi.get("rails") or {}
+    return {
+        "core_volts": pi.get("volts"),
+        "core_volts_min": pi.get("volts_min"),
+        "core_volts_max": pi.get("volts_max"),
+        "rails_volts": {k: round(v, 4) for k, v in sorted(rails.items())},
+        "throttled_hex": pi.get("throttle_raw"),
+        "throttle_now": pi.get("throttle_now") or [],
+        "throttle_seen": pi.get("throttle_seen") or [],
+        "under_voltage_now": any("under-voltage" in f for f in (pi.get("throttle_now") or [])),
+        "under_voltage_seen": any("under-voltage" in f for f in (pi.get("throttle_seen") or [])),
+    }
+
+
 def snapshot_json(s: dict, col: Collector, top: int = 10) -> dict:
     """Stable, script-friendly view of one snapshot (no rich objects inside)."""
     vm, sw = s["mem"], s["swap"]
@@ -1843,6 +2142,8 @@ def snapshot_json(s: dict, col: Collector, top: int = 10) -> dict:
             "load": [round(x, 2) for x in s["load"]],
             "governor": s["pi"].get("governor"),
             "peak_pct": round(s["peak_cpu"], 1),
+            "clock_hz": round((s.get("clock") or {}).get("mhz", 0.0) * 1e6),
+            "clock": _clock_json(s.get("clock") or {}),
         },
         "memory": {
             "used": vm.used, "total": vm.total, "available": vm.available,
@@ -1863,6 +2164,7 @@ def snapshot_json(s: dict, col: Collector, top: int = 10) -> dict:
             "core_volts": s["pi"]["volts"],
             "clocks_hz": s["pi"]["clocks"],
         },
+        "power": _power_json(s),
         "disk": {
             "mounts": [
                 {
@@ -1974,11 +2276,10 @@ def main(argv: list[str] | None = None) -> int:
         saved = load_config().get("theme") or DEFAULT_THEME
         for name in known_themes:
             print(f"{'*' if name == saved else ' '} {name}")
-        print(f"\n(* = remembered; choose with pistat --theme NAME or ^p in the TUI)")
+        print("\n(* = remembered; choose with pistat --theme NAME or ^p in the TUI)")
         return 0
-    if args.theme is not None and not args.once and not args.json:
-        if args.theme not in known_themes:
-            ap.error(f"unknown theme {args.theme!r} — run 'pistat --themes' for the list")
+    if args.theme is not None and args.theme not in known_themes:
+        ap.error(f"unknown theme {args.theme!r} — run 'pistat --themes' for the list")
 
     interval = max(MIN_INTERVAL, args.interval)
     if interval != args.interval:
