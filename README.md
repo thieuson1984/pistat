@@ -13,6 +13,7 @@ pistat --once -w 72     # same, forced to 72 columns
 pistat --json           # one snapshot as JSON (cron, Prometheus textfile, jq)
 pistat --themes         # list themes, * marks the remembered one
 pistat --theme nord     # start in nord and remember it
+pistat --swatch nord    # paint that theme's colours and exit (no tty needed)
 pistat --version
 ```
 
@@ -60,7 +61,7 @@ Runtime: Python ≥ 3.9, `textual ≥ 0.47`, `rich ≥ 13`, `psutil ≥ 5.9`, Li
 
 | Panel | Contents |
 |---|---|
-| CPU | load average, governor, **live clock** with % of the governor ceiling and a 150-sample sparkline, session peak, overall + per-core usage bars, per-core clock |
+| CPU | load average, governor, **requested clock** with % of the governor ceiling and a 150-sample sparkline, **measured clock** (time-weighted over the sample window) with residency at the top DVFS state and the transition count, **core voltage** to 0.1 mV with the session range and the clock it belongs to, session peak, overall + per-core usage, per-core clock |
 | THERMAL · CLOCK · POWER | SoC (`cpu-thermal`) and PMIC temperature, session peak, headroom to the 80 °C soft limit, decoded `vcgencmd get_throttled` state split into **now** vs **seen since boot**, the latched `rpi_volt` under-voltage alarm, live ARM clock + % of max, core/v3d clocks, core rail voltage to 10 µV with a change arrow, SDRAM rail, fan tachometer if one is exposed, board revision, uptime |
 | MEMORY · PROCESSES | RAM and swap bars + absolute values, live swap in/out **rates**, free/cached, process and thread counts, peak usage, process state histogram (running / sleeping / idle / zombie …) |
 | DISK · I/O | per-mount usage (/, /boot/firmware …), live read/write rates, cumulative I/O, free space, `+N mounts` when more are hidden |
@@ -85,31 +86,60 @@ the notification will tell you.
 
 `--once` prints the same panels plus the top 10 processes by CPU.
 
-## Real-time clock and voltage
+## Accurate clock and voltage
 
-The clock and the core voltage are the two numbers that show whether the
-governor is actually doing anything, so both are refreshed on the sampling tick
-rather than behind a cache:
+The clock and the core rail are the two numbers that show whether the governor
+is actually doing anything, and both were the easiest to get *wrong*. Three
+things changed in 1.4.0:
+
+**The clock now has a measured value, not just a sampled one.** A single
+`scaling_cur_freq` read per tick is a point sample: `ondemand` can spend 900 ms
+of a second at 600 MHz, serve a 100 ms burst, and be caught at 1.8 GHz — the
+panel then reports 1.8 GHz for a second in which the CPU was mostly idle.
+`cpufreq/policy0/stats/time_in_state` accumulates USER_HZ ticks per frequency,
+so the delta between two samples gives the time-weighted mean, the residency at
+each state, and (from `total_trans`) the exact transition count for the window:
+
+```
+clk   1.800GHz 100% ▁▁▁▁▁▁██████     ← requested, one instant per tick
+avg   1.734GHz  91%@max 12 st        ← measured: time-weighted over the window
+```
+
+`cpuinfo_cur_freq` (the clock the silicon reports) is preferred over
+`scaling_cur_freq` (what the governor asked for) when the kernel exposes it; on
+a Pi it is root-only, so the request is the fallback and the CPU detail screen
+says which source answered.
+
+**The voltage is read with the clock it belongs to.** Every fresh rail reading
+is paired with the live clock into a v/f table (`1.80G@0.9285V`), the session
+min/max is kept, and the regulator's step is derived from the distinct values
+seen — 25 mV on this board, which is exactly why the value is printed to four
+decimals. The rail is re-read on every tick when the interval allows it (a fork
+costs 2–3 ms), so a DVFS transition is not missed between samples.
+
+**The firmware clock is a cross-check, not the source.** `vcgencmd
+measure_clock arm` forks for a number sysfs already has, so it stays on a slow
+TTL and appears in the CPU detail screen as `firmware arm 1800.00 MHz vs sysfs
+1800 MHz (Δ +0.00 MHz)` — a large Δ means the governor's request has not taken
+effect yet, which is a genuinely useful signal that one number cannot give.
 
 | Signal | Source | Cost | Refresh |
 |---|---|---|---|
-| ARM clock, per core | `/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq` | ≈30 µs for all 4 cores | every tick |
+| Per-core clock | `cpu*/cpufreq/cpuinfo_cur_freq`, else `scaling_cur_freq` | ≈40 µs for 4 cores | every tick |
+| Measured clock, residency, transitions | `policy0/stats/time_in_state`, `total_trans` | ≈30 µs | every tick |
 | Governor limits | `policy0/{scaling_min,scaling_max}_freq`, `scaling_governor` | 4 small reads | 10 s |
-| Core voltage | `vcgencmd measure_volts core` | ≈2 ms (one fork) | 1.5 s |
+| Core voltage + v/f pair | `vcgencmd measure_volts core` | ≈2 ms (one fork) | every tick (≥0.2 s) |
 | SDRAM rails | `vcgencmd measure_volts sdram_{c,i,p}` | ≈2 ms each | 30 s |
 | core / v3d / emmc clock | `vcgencmd measure_clock` | ≈2 ms each | 5 s |
 | Throttle state | `vcgencmd get_throttled` | ≈2 ms | 1 s |
 | PMIC temperature | `vcgencmd measure_temp pmic` | ≈2.3 ms | 2.5 s |
 
-`vcgencmd measure_clock arm` forks a process for a number sysfs already has, so
-it is gone: the firmware's ARM figure is only a fallback for kernels without
-`cpufreq`. Everything the firmware *must* answer is sampled on its own TTL, so
-the dashboard costs less than it did while updating the clock 1–10× faster.
-
-The panels show the session envelope, not just the instant: `clock 1.800GHz
-100% ████` with a sparkline pinned to the 600 MHz–1.8 GHz governor range, and
-`volt core 0.9285V↑` where the arrow marks a rail change since the last read.
-`r` resets the peak/floor/dvfs-step counters.
+The panels show the session envelope, not just the instant: a sparkline pinned
+to the 600 MHz–1.8 GHz governor range, `volt 0.9285V ▲ 0.8500–0.9500` for the
+rail, and `r` resets the peak/floor/step counters. `c` opens the **CPU detail**
+screen, which is where the evidence lives: per-core clocks, the requested /
+measured / firmware comparison, the residency histogram, the observed v/f pairs
+and the SDRAM rails. It repaints on every sample while it is open.
 
 Throttle bits 0–3 mean *now* and are red; bits 16–19 — and the `rpi_volt`
 latched alarm, which also survives reboots — are reported as `OK now · seen:
@@ -132,7 +162,9 @@ the panel red for the rest of the uptime after a single brown-out at boot.
 | `pgup` `pgdn` `home` `end` | page / jump |
 | `1` `2` `5` | sampling interval in seconds |
 | `r` | reset peak trackers |
-| `^p` | command palette — **Change theme** switches the whole colour scheme |
+| `t` | theme picker — the dashboard previews each theme live; `enter` keeps it, `esc` goes back |
+| `c` | CPU detail screen (measured vs requested clock, residency, v/f pairs) |
+| `^p` | command palette — **Change theme** also works, without the preview |
 
 ## Responsive layout
 
@@ -157,14 +189,17 @@ whole window.
 ```json
 {
   "host": "pi.kapp.vn", "board": "Raspberry Pi 4 Model B Rev 1.2",
-  "pistat": "1.3.0", "time": "2026-10-23T00:45:32+0700", "uptime_s": 4821.1,
+  "pistat": "1.4.0", "time": "2026-10-23T00:45:32+0700", "uptime_s": 4821.1,
   "cpu":    {"total_pct": 11.6, "per_core_pct": [2.9, 6.1, 28.6, 8.8],
              "per_core_mhz": [1800, 1800, 1800, 1800], "load": [1.41, 1.06, 0.68],
              "governor": "ondemand", "peak_pct": 25.0, "clock_hz": 1800000000,
              "clock": {"current_mhz": 1800.0, "peak_mhz": 1800.0, "floor_mhz": 600.0,
                        "core_min_mhz": 1800.0, "core_max_mhz": 1800.0, "spread_mhz": 0.0,
                        "limit_min_mhz": 600.0, "limit_max_mhz": 1800.0,
-                       "pct_of_max": 100.0, "dvfs_steps": 12, "governor": "ondemand"}},
+                       "pct_of_max": 100.0, "dvfs_steps": 12, "governor": "ondemand",
+                       "weighted_mhz": 1734.0, "weighted_ready": true, "window_s": 1.0,
+                       "residency_max_pct": 91.0, "residency_min_pct": 2.0,
+                       "transitions": 12, "source": "cpufreq"}},
   "memory": {"used": 1230643200, "total": 3979075584, "available": 2748432384,
              "cached": 2127085568, "percent": 30.9, "peak_percent": 30.9},
   "swap":   {"used": 0, "total": 5867823104, "percent": 0.0,
@@ -175,6 +210,7 @@ whole window.
              "clocks_hz": {"core": 500000992, "v3d": 500000992,
                             "emmc": 250000496, "arm": 1800000000}},
   "power":  {"core_volts": 0.9285, "core_volts_min": 0.85, "core_volts_max": 0.9285,
+             "core_volts_step_mv": 25.0, "vf_pairs": {"600": 0.9, "1800": 0.9285},
              "rails_volts": {"sdram_c": 1.1, "sdram_i": 1.1, "sdram_p": 1.1},
              "throttled_hex": "0x0", "throttle_now": [], "throttle_seen": [],
              "under_voltage_now": false, "under_voltage_seen": false},
@@ -190,10 +226,13 @@ whole window.
 
 Every block is present even when a sensor is missing (`null`, `{}` or `0`), so a
 consumer never has to guess. `cpu.clock` and `power` are the fields to watch for
-DVFS and brown-out evidence: `floor_mhz` is the lowest average clock seen this
-run, `dvfs_steps` counts governor transitions, and `under_voltage_seen` is the
-firmware's latched bit (once true it stays true until reboot). Example cron
-entry:
+DVFS and brown-out evidence: `current_mhz` is the sampled governor request,
+`weighted_mhz` is the measured mean over `window_s` (with `residency_max_pct` /
+`residency_min_pct` for where it spent its time and `transitions` for how often
+it moved), `floor_mhz` is the lowest clock seen this run, and
+`under_voltage_seen` is the firmware's latched bit (once true it stays true
+until reboot). `power.vf_pairs` is `{clock_mhz: volts}` as actually observed
+together, and `core_volts_step_mv` is the regulator's step. Example cron entry:
 
 ```cron
 * * * * * /home/pi/.local/bin/pistat --json > /var/lib/node_exporter/textfile/pistat.json.tmp && mv …
@@ -203,16 +242,30 @@ entry:
 
 The chrome is drawn with Textual theme variables (`$background`, `$panel`,
 `$primary`, …) and the hand-drawn panels derive their colours from the active
-theme, so **`^p` → Change theme** recolours everything — including the bars and
-sparklines. The choice is written to `$XDG_CONFIG_HOME/pistat/config.json`
+theme, so a theme switch recolours everything — including the bars and
+sparklines.
+
+**`t` opens the picker with a live preview.** It docks to the right of the
+screen (the dashboard stays visible on the left) and moving the cursor applies
+that theme immediately, so what you are choosing is the dashboard as it will
+look — not a list of names. The panel shows a swatch of the theme's own palette
+for the values the CPU card draws, including a body sample on that theme's
+background. `enter` keeps the theme and writes it to the config, `esc` puts the
+previous one back; **a preview is never saved** — only a confirmed choice is.
+Typing narrows the list by name, and the picker swallows every key while it has
+focus (`q` filters, it does not quit).
+
+The choice is written to `$XDG_CONFIG_HOME/pistat/config.json`
 (`~/.config/pistat/config.json` by default) and restored on the next run, so it
 never has to be re-picked. `pistat --theme NAME` sets and remembers a theme
-without opening the palette, `pistat --themes` lists them, and `pistat` is
-registered as the default theme; the 20-odd built-ins (nord, gruvbox,
-catppuccin, solarized, dracula, tokyo-night, ansi-light …) are all selectable.
-A theme name that disappears (or a corrupt config file) falls back to the
-default instead of breaking startup; `PISTAT_CONFIG_DIR` relocates the file,
-which is how the tests keep your real preference untouched.
+without opening the picker, `pistat --themes` lists them, and `pistat --swatch
+NAME` paints one theme's colours to stdout (no tty required — useful over ssh
+and as the non-interactive test for the palette mapping). `pistat` is registered
+as the default theme; the 20-odd built-ins (nord, gruvbox, catppuccin,
+solarized, dracula, tokyo-night, ansi-light …) are all selectable. A theme name
+that disappears (or a corrupt config file) falls back to the default instead of
+breaking startup; `PISTAT_CONFIG_DIR` relocates the file, which is how the tests
+keep your real preference untouched.
 
 Two details worth knowing: the `text-*` theme variables are used because they
 are contrast-corrected for text on the theme background, and any 8-digit
@@ -252,16 +305,25 @@ slate palette.
   light and dark themes without any contrast arithmetic.
 - **Signals are always confirmed** through a modal that names the pid, user and
   signal; `x`/`X` never fire directly. PID 1 and pistat's own pid are refused.
-- Measured on this Pi 4 at 120 × 44: **≈12.5 % of one core (≈3 % of the whole
-  machine)** at the 1 s default — the three extra live sparklines cost ~0.5 pp
-  over 1.2.1 while the collector itself dropped from ~24 ms to ~22 ms per
-  sample. For comparison `htop` runs at ≈2 % of a core.
-- No writes: everything is read-only except the terminal and the theme
+- **Measured clock comes from counters, not samples**: one `time_in_state` read
+  per tick (≈30 µs) replaces a guess that could be a whole DVFS state wrong.
+- Measured on this Pi 4 at 120 × 44: **≈12.6 % of one core (≈3.1 % of the whole
+  machine)** at the 1 s default — reading the core rail every tick and the
+  residency counters costs ~1 pp over 1.3.0; at the 2 s interval it is 6.9 %.
+  For comparison `htop` runs at ≈2 % of a core.
+- **No writes**: everything is read-only except the terminal and the theme
   preference file.
+
+## Roadmap
+
+The next features are tracked in [ROADMAP.md](ROADMAP.md) — alerts with
+thresholds, per-core history, and exporting the JSON schema as a Prometheus
+textfile. Anything already shipped is listed there with the release it landed
+in, so the file is never a wish list that silently rots.
 
 ## Tests
 
-`pytest` is the way in — 39 checks, no plugins required (`tests/conftest.py`
+`pytest` is the way in — 63 checks, no plugins required (`tests/conftest.py`
 runs the `async def` tests, so the suite works on a bare interpreter):
 
 ```sh
@@ -273,9 +335,10 @@ python3 -m pytest tests/ -q
 |---|---|
 | `test_layout.py` | 11 terminal sizes: list visible, grid shape, nothing clipped |
 | `test_keys.py` | bindings, sort cycle, filter, navigation |
-| `test_features.py` | theme switching + persistence, header sorting, kill dialogs |
+| `test_features.py` | theme persistence, header sorting, kill dialogs |
 | `test_cli.py` | `--version/--json/--once/-w/--themes`, interval clamp, no ANSI in a pipe |
-| `test_telemetry.py` | clock block, volts/rails, throttle now-vs-seen, renderers, JSON |
+| `test_telemetry.py` | clock block, residency/weighted clock, cpuinfo vs scaling source, v/f pairs and the regulator step, volts/rails, throttle now-vs-seen, renderers, JSON |
+| `test_theme_detail.py` | swatch colours per theme, picker previews without saving, typing filters without leaking keys, CPU detail renderer |
 
 Each file also runs standalone (`python3 tests/test_layout.py`), and the
 harnesses below stay scripts on purpose — they print numbers, they do not

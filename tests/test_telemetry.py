@@ -19,12 +19,19 @@ from pistat import Collector
 # fakes
 # --------------------------------------------------------------------------- #
 def fake_sysfs(clock_mhz: dict[int, int], limits=(600, 1800), governor="ondemand"):
-    """A read_text() stand-in serving cpufreq files for `clock_mhz`."""
+    """A read_text() stand-in serving cpufreq files for `clock_mhz`.
+
+    `cpuinfo_cur_freq` answers with the same clock as `scaling_cur_freq` unless
+    the caller overrides it; the residency counters are stubbed out so a test
+    never reads the developer's real time_in_state.
+    """
     real = pistat.read_text
     core_re = re.compile(r"/cpu(\d+)/cpufreq/")
 
     def read(path: str):
         p = str(path)
+        if "/stats/" in p:
+            return None
         if "/cpufreq/policy0/" in p:
             if p.endswith(("scaling_min_freq", "cpuinfo_min_freq")):
                 return str(limits[0] * 1000)
@@ -33,7 +40,7 @@ def fake_sysfs(clock_mhz: dict[int, int], limits=(600, 1800), governor="ondemand
             if p.endswith("scaling_governor"):
                 return governor
         match = core_re.search(p)
-        if match and p.endswith("scaling_cur_freq"):
+        if match and p.endswith(("scaling_cur_freq", "cpuinfo_cur_freq")):
             mhz = clock_mhz.get(int(match.group(1)))
             return str(mhz * 1000) if mhz is not None else None
         return real(path)
@@ -300,7 +307,9 @@ def test_render_hist_has_clock_and_voltage():
     t = pistat.render_hist(snapshot(), c, width=36)
     flat = t.plain
     assert "clk" in flat and "1.80G" in flat, flat
-    assert "volt" in flat and "0.928V" in flat, flat
+    # 4 decimals here too: the history must not round away the DVFS step the
+    # CPU panel is careful to show
+    assert "volt" in flat and "0.9285V" in flat, flat
     assert len(lines_of(t)) <= 7, lines_of(t)
 
 
@@ -344,3 +353,182 @@ def test_power_json_flags_under_voltage():
     assert p["under_voltage_now"] is False
     assert p["rails_volts"]["sdram_c"] == 1.1
     assert p["core_volts"] == 0.9285
+
+
+# --------------------------------------------------------------------------- #
+# the measured clock: cpufreq time_in_state, not a single sample
+# --------------------------------------------------------------------------- #
+class FakeStats:
+    """Mutable cpufreq residency counters: time_in_state per frequency + trans."""
+
+    def __init__(self, states=None, trans=0, clocks=None):
+        self.states = dict(states or {})
+        self.trans = trans
+        self.base = fake_sysfs(clocks or {i: 1800 for i in range(4)})
+
+    def bump(self, mhz: int, ticks: int, trans: int = 0) -> None:
+        self.states[mhz] = self.states.get(mhz, 0) + ticks
+        self.trans += trans
+
+    def __call__(self, path: str):
+        p = str(path)
+        if p.endswith("/stats/time_in_state"):
+            return "\n".join(f"{f} {t}" for f, t in self.states.items())
+        if p.endswith("/stats/total_trans"):
+            return str(self.trans)
+        return self.base(p)
+
+
+def test_residency_weights_by_time_not_by_samples(monkeypatch):
+    """75% of the window at 600 MHz and 25% at 1800 MHz means 900 MHz, not 1800."""
+    stats = FakeStats({600000: 0, 1800000: 0})
+    monkeypatch.setattr(pistat, "read_text", stats)
+    c = Collector()
+    assert c._residency()["ready"] is False, "the first read is only a baseline"
+    stats.bump(600000, 75)
+    stats.bump(1800000, 25)
+    res = c._residency()
+    assert res["ready"] is True
+    assert abs(res["weighted_mhz"] - 900.0) < 0.01, res
+    assert abs(res["residency"][600.0] - 75.0) < 0.01
+    assert abs(res["residency_max"] - 25.0) < 0.01
+    assert abs(res["window_s"] - 1.0) < 0.01       # 100 ticks at USER_HZ=100
+
+
+def test_residency_counts_real_transitions(monkeypatch):
+    stats = FakeStats({600000: 0, 1800000: 0})
+    monkeypatch.setattr(pistat, "read_text", stats)
+    c = Collector()
+    c._residency()
+    stats.bump(600000, 50, trans=3)
+    stats.bump(1800000, 50, trans=2)
+    assert c._residency()["transitions"] == 5
+
+
+def test_residency_ignores_a_counter_that_went_backwards(monkeypatch):
+    """A reset/rollback must not produce negative time or a negative clock."""
+    stats = FakeStats({600000: 1000, 1800000: 1000})
+    monkeypatch.setattr(pistat, "read_text", stats)
+    c = Collector()
+    c._residency()
+    stats.states = {600000: 10, 1800000: 10}       # stats were cleared
+    res = c._residency()
+    assert res["weighted_mhz"] == 0.0 and res["states"] == []
+
+
+def test_clock_block_reports_the_measured_clock(monkeypatch):
+    stats = FakeStats({600000: 0, 1800000: 0})
+    monkeypatch.setattr(pistat, "read_text", stats)
+    c = Collector()
+    c._clock_block()                               # baseline
+    stats.bump(1800000, 90, trans=4)
+    stats.bump(600000, 10)
+    ck = c._clock_block()
+    assert ck["weighted_ready"] is True
+    assert abs(ck["weighted_mhz"] - 1680.0) < 0.01, ck
+    assert ck["residency_max"] == 90.0
+    assert ck["transitions"] == 4
+    assert ck["dvfs_steps"] == 4, "the governor's own counter beats the guess"
+    assert ck["source"] in ("cpuinfo", "cpufreq")
+
+
+def test_core_freqs_prefers_the_hardware_reading(monkeypatch):
+    def read(path: str):
+        if path.endswith("cpuinfo_cur_freq"):
+            return "1500000"
+        if path.endswith("scaling_cur_freq"):
+            return "1800000"
+        return None
+
+    monkeypatch.setattr(pistat, "read_text", read)
+    c = Collector()
+    assert c._core_freqs()[0] == 1500.0
+    assert c._freq_source == "cpuinfo"
+
+
+def test_core_freqs_reports_a_mixed_source(monkeypatch):
+    """Some cores readable, some not: the panel must not claim one source."""
+
+    def read(path: str):
+        if path.endswith("cpuinfo_cur_freq") and "/cpu0/" in path:
+            return "1500000"
+        if path.endswith("scaling_cur_freq"):
+            return "1800000"
+        return None
+
+    monkeypatch.setattr(pistat, "read_text", read)
+    c = Collector()
+    assert c._core_freqs()[0] == 1500.0
+    assert c._freq_source == "mixed"
+
+
+def test_core_freqs_falls_back_to_the_governor_request(monkeypatch):
+    """On a Pi `cpuinfo_cur_freq` is root-only; the request is the fallback."""
+
+    def read(path: str):
+        if path.endswith("cpuinfo_cur_freq"):
+            return None
+        if path.endswith("scaling_cur_freq"):
+            return "1200000"
+        return None
+
+    monkeypatch.setattr(pistat, "read_text", read)
+    c = Collector()
+    assert c._core_freqs()[1] == 1200.0
+    assert c._freq_source == "cpufreq"
+
+
+# --------------------------------------------------------------------------- #
+# the core rail: v/f pairs and the regulator step
+# --------------------------------------------------------------------------- #
+def test_volts_block_pairs_each_reading_with_its_clock(monkeypatch):
+    vcg = FakeVcgencmd(volts=0.9285)
+    monkeypatch.setattr(pistat, "vcgencmd", vcg)
+    c = Collector()
+    assert c._volts_block(ttl=0.0, mhz=1800.0)["vf"] == {1800: 0.9285}
+    vcg.volts = 0.8500
+    second = c._volts_block(ttl=0.0, mhz=600.0)
+    assert second["vf"] == {600: 0.85, 1800: 0.9285}
+    assert second["step_mv"] == 78.5
+
+
+def test_volt_step_reports_the_regulator_step():
+    assert pistat.volt_step_mv([0.85, 0.875, 0.9]) == 25.0
+    assert pistat.volt_step_mv([0.9285]) is None
+
+
+def test_render_cpu_shows_voltage_and_the_measured_clock():
+    s = snapshot(volts=0.9285)
+    s["clock"].update({"weighted_mhz": 1723.4, "weighted_ready": True,
+                       "residency_max": 91.0, "residency_min": 2.0,
+                       "transitions": 12, "window_s": 1.0, "source": "cpufreq"})
+    t = pistat.render_cpu(s, width=46, height=7)
+    flat = t.plain
+    assert "volt" in flat and "0.9285V" in flat, flat
+    assert "1.723GHz" in flat, "the measured clock is missing"
+    assert "91%@max" in flat, flat
+    lines = lines_of(t)
+    assert len(lines) <= 7, lines
+    for line in lines:
+        assert len(line) <= 46, (len(line), line)
+
+
+def test_render_cpu_never_wraps_at_any_width_or_height():
+    s = snapshot()
+    s["clock"].update({"weighted_mhz": 1723.4, "weighted_ready": True,
+                       "residency_max": 91.0, "transitions": 12})
+    for width in (28, 30, 34, 38, 40, 46, 60):
+        for height in (6, 7, 8, 12):
+            for line in lines_of(pistat.render_cpu(s, width=width, height=height)):
+                assert len(line) <= width, (width, height, len(line), line)
+
+
+def test_clock_json_carries_the_measured_clock():
+    out = pistat._clock_json({"weighted_mhz": 1723.4, "weighted_ready": True,
+                              "window_s": 0.987, "residency_max": 91.2,
+                              "transitions": 12, "source": "cpufreq"})
+    assert out["weighted_mhz"] == 1723.4
+    assert out["weighted_ready"] is True
+    assert out["window_s"] == 0.99
+    assert out["residency_max_pct"] == 91.2
+    assert out["transitions"] == 12

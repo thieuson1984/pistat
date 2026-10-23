@@ -2,18 +2,21 @@
 """
 pistat — a real-time TUI dashboard for this machine (Raspberry Pi 4 / Debian).
 
-Panels: CPU (per-core load, clock, governor), memory + swap, disks + I/O rates,
-network throughput, Raspberry Pi thermal / clock / throttle / power telemetry,
-rolling sparklines, and a sortable process table with state statistics.
+Panels: CPU (per-core load, requested + measured clock, core voltage, governor),
+memory + swap, disks + I/O rates, network throughput, Raspberry Pi thermal /
+clock / throttle / power telemetry, rolling sparklines, and a sortable process
+table with state statistics.
 
   pistat.py               interactive TUI
   pistat.py --once        one plain-text snapshot, then exit
   pistat.py -i 0.5        sampling interval in seconds (default 1.0)
   pistat.py --themes      list theme names (* = the remembered one)
   pistat.py --theme nord  start in nord and remember it for next time
+  pistat.py --swatch nord paint that theme's colours and exit (no tty needed)
 
 Keys: q quit · p pause · s cycle sort · S reverse · 1/2/5 interval · r reset
-      peaks · / filter · j/k or arrows move · PgUp/PgDn · Home/End
+      peaks · / filter · t themes (live preview) · c CPU detail
+      j/k or arrows move · PgUp/PgDn · Home/End
 """
 
 from __future__ import annotations
@@ -39,12 +42,12 @@ from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.theme import BUILTIN_THEMES, Theme
 from textual.widgets import Footer, Header, Input, Static
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 MIN_INTERVAL = 0.1          # below this a 1 s timer would busy-loop the CPU
 DEFAULT_WIDTH = 100         # --once fallback width when stdout is a pipe
@@ -228,6 +231,74 @@ def palette_from_theme(theme: Theme) -> dict[str, str]:
         "magenta": pick("text-accent", "accent", default=PALETTE["magenta"]),
         "track": pick("surface-lighten-2", "panel-lighten-2", default=PALETTE["track"]),
     }
+
+
+def theme_object(name: str) -> Theme:
+    """Resolve a theme name to a Theme (our own palette or a built-in)."""
+    if name == PISTAT_THEME.name:
+        return PISTAT_THEME
+    return BUILTIN_THEMES.get(name) or PISTAT_THEME
+
+
+def theme_names() -> list[str]:
+    """Every selectable theme: ours first, then the built-ins alphabetically."""
+    return [PISTAT_THEME.name, *sorted(BUILTIN_THEMES)]
+
+
+def theme_surface(theme: Theme) -> str:
+    """The theme's background as a solid hex Rich can paint with."""
+    try:
+        gen = theme.to_color_system().generate()
+    except Exception:                     # noqa: BLE001 — a theme must never crash a preview
+        return "#0b1220"
+    base = _rgb(gen.get("background") or "") or (11, 18, 32)
+    for key in ("surface", "background", "panel"):
+        solid = _solid(gen.get(key) or "", base)
+        if solid:
+            return solid
+    return "#0b1220"
+
+
+def theme_swatch(name: str, width: int = 40) -> Text:
+    """Paint the sample values a panel draws, using one theme's own colours.
+
+    This is what makes the theme picker a *preview*: the dashboard behind the
+    dialog repaints live, and this strip shows how the hand-drawn panel text
+    will read without having to wait for the next sample.
+    """
+    theme = theme_object(name)
+    p = palette_from_theme(theme)
+    bg = theme_surface(theme)
+    t = Text()
+
+    t.append("clk ", style=p["label"])
+    t.append("1.800GHz", style=p["accent"])
+    t.append("  volt ", style=p["label"])
+    t.append("0.9285V", style=p["value"])
+    t.append("  cpu ", style=p["label"])
+    t.append("12.3%", style=p["ok"])
+    t.append("\n")
+
+    t.append("temp ", style=p["label"])
+    t.append("72.1°C", style=p["warn"])
+    t.append("  hot ", style=p["label"])
+    t.append("81.0°C", style=p["hot"])
+    t.append("  uv ", style=p["label"])
+    t.append("NOW", style=p["bad"])
+    t.append("\n")
+
+    # a real bar: filled cells in the accent, empty cells in the theme track
+    cells = max(6, min(20, width - 8))
+    filled = max(1, int(cells * 0.62))
+    t.append("bar  ", style=p["label"])
+    t.append(BAR_FULL * filled, style=p["accent"])
+    t.append(BAR_EMPTY * (cells - filled), style=p["track"])
+    t.append("\n")
+
+    # and the panel body itself, so light themes look light and dark look dark
+    t.append("body ", style=p["label"])
+    t.append(" 1.800GHz  0.9285V  12.3% ", style=f"{p['value']} on {bg}")
+    return t
 
 
 MOUNT_ALIAS = {
@@ -438,6 +509,22 @@ def parse_vcg(out: str | None) -> float | None:
         return None
 
 
+def volt_step_mv(values) -> float | None:
+    """The smallest gap between the voltages seen so far — the DVFS step.
+
+    A Pi regulator moves in fixed steps (25 mV on a Pi 4). Printing the gap
+    proves the reading is a step function rather than sensor noise, and it shows
+    at a glance whether a config change altered the voltage table.
+    """
+    uniq = sorted({round(float(v), 4) for v in values if v})
+    gaps = []
+    for i in range(1, len(uniq)):
+        gap = uniq[i] - uniq[i - 1]
+        if gap > 1e-6:
+            gaps.append(round(gap * 1000.0, 1))
+    return min(gaps) if gaps else None
+
+
 def decode_throttle(raw: str | None) -> dict:
     """Split `get_throttled` into live faults and bits latched since boot.
 
@@ -462,6 +549,19 @@ def decode_throttle(raw: str | None) -> dict:
 # --------------------------------------------------------------------------- #
 # sampling
 # --------------------------------------------------------------------------- #
+# cpufreq residency counters: cumulative USER_HZ ticks per frequency. The
+# delta between two samples is the only honest answer to "what clock did the
+# CPU actually run at", which a single scaling_cur_freq read cannot give.
+TIS_PATHS = (
+    "/sys/devices/system/cpu/cpufreq/policy0/stats/time_in_state",
+    "/sys/devices/system/cpu/cpu0/cpufreq/stats/time_in_state",
+)
+TRANS_PATHS = (
+    "/sys/devices/system/cpu/cpufreq/policy0/stats/total_trans",
+    "/sys/devices/system/cpu/cpu0/cpufreq/stats/total_trans",
+)
+
+
 class Collector:
     """Produces one coherent snapshot per call. Blocking but cheap (~50-120 ms)."""
 
@@ -514,6 +614,14 @@ class Collector:
         self._last_step_mhz = 0.0
         self.volt_min: float | None = None
         self.volt_max: float | None = None
+        # cpufreq residency counters (cumulative since boot) and the v/f pairs
+        # actually observed together — the evidence behind the "measured" clock
+        self._tis: dict[int, int] | None = None
+        self._tis_trans: int | None = None
+        self._vf: dict[int, float] = {}       # MHz -> core volts seen with it
+        self._volt_seen: list[float] = []     # distinct rails, for the DVFS step
+        self._freq_source = "n/a"             # cpuinfo | cpufreq | none
+        self.volt_ttl = 1.5                   # seconds; the app tightens this
         self.board = (read_text("/proc/device-tree/model") or "").replace("\x00", "")
         self.ncpu = psutil.cpu_count(logical=True) or 1
         # prime the CPU deltas so the first sample is meaningful
@@ -581,11 +689,89 @@ class Collector:
         return fans
 
     def _core_freqs(self) -> list[float]:
+        """Per-core live clock in MHz, preferring what the hardware reports.
+
+        `cpuinfo_cur_freq` is the clock the silicon is running at;
+        `scaling_cur_freq` is only what the governor last requested (on many
+        kernels they differ by a whole DVFS step, and on the Pi the former is
+        root-only). Try the real one, fall back to the request, and record which
+        source answered so the panel can say how it knows.
+        """
         freqs = []
+        real = asked = 0
         for i in range(self.ncpu):
-            raw = read_text(f"/sys/devices/system/cpu/cpu{i}/cpufreq/scaling_cur_freq")
+            base = f"/sys/devices/system/cpu/cpu{i}/cpufreq"
+            raw = read_text(f"{base}/cpuinfo_cur_freq")
+            if raw and raw.isdigit() and int(raw) > 0:
+                real += 1
+            else:
+                raw = read_text(f"{base}/scaling_cur_freq")
+                if raw and raw.isdigit() and int(raw) > 0:
+                    asked += 1
             freqs.append(int(raw) / 1000.0 if raw and raw.isdigit() else 0.0)
+        self._freq_source = ("cpuinfo" if real and not asked else
+                             "cpufreq" if asked and not real else
+                             "mixed" if real and asked else "none")
         return freqs
+
+    def _residency(self) -> dict:
+        """cpufreq time-in-state deltas: the clock the cores actually ran at.
+
+        `scaling_cur_freq` is one instant per tick; an ondemand governor can
+        spend most of a second at 600 MHz, serve a burst, and still be sampled
+        at 1.8 GHz (or the reverse). `stats/time_in_state` accumulates USER_HZ
+        ticks per frequency, so the delta between two samples gives the
+        time-weighted mean clock, the residency at each state, and — from
+        `total_trans` — the exact number of DVFS transitions in the window.
+        """
+        raw = ""
+        for path in TIS_PATHS:
+            raw = read_text(path) or ""
+            if raw:
+                break
+        if not raw:
+            return {}
+        cur: dict[int, int] = {}
+        for line in raw.splitlines():
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            try:
+                cur[int(parts[0])] = int(parts[1])
+            except ValueError:
+                continue
+        if not cur:
+            return {}
+        trans_now: int | None = None
+        for path in TRANS_PATHS:
+            value = read_text(path)
+            if value and value.isdigit():
+                trans_now = int(value)
+                break
+        prev, trans_prev = self._tis, self._tis_trans
+        self._tis, self._tis_trans = cur, trans_now
+        if prev is None:
+            # first read is a baseline: there is no window to average yet
+            return {"ready": False, "window_s": 0.0, "weighted_mhz": 0.0,
+                    "residency": {}, "states": [], "transitions": 0,
+                    "residency_max": 0.0, "residency_min": 0.0,
+                    "max_mhz": max(cur) / 1000.0, "min_mhz": min(cur) / 1000.0}
+        delta = {f: max(0, t - prev.get(f, 0)) for f, t in cur.items()}
+        ticks = sum(delta.values())
+        states = sorted(((f / 1000.0, d) for f, d in delta.items() if d), reverse=True)
+        return {
+            "ready": True,
+            "window_s": ticks / max(1, self._clk),
+            "weighted_mhz": (sum(f * d for f, d in states) / ticks) if ticks else 0.0,
+            "residency": {f: 100.0 * d / ticks for f, d in states} if ticks else {},
+            "residency_max": 100.0 * delta.get(max(cur), 0) / ticks if ticks else 0.0,
+            "residency_min": 100.0 * delta.get(min(cur), 0) / ticks if ticks else 0.0,
+            "transitions": (max(0, trans_now - trans_prev)
+                            if trans_now is not None and trans_prev is not None else None),
+            "states": [(f, round(100.0 * d / ticks, 1)) for f, d in states] if ticks else [],
+            "max_mhz": max(cur) / 1000.0,
+            "min_mhz": min(cur) / 1000.0,
+        }
 
     def _pmic_temp(self, ttl: float = 2.5) -> float | None:
         """PMIC temperature via the firmware mailbox — 2.3 ms per fork, so TTL'd."""
@@ -634,20 +820,43 @@ class Collector:
         freqs = [f for f in self._core_freqs()]
         live = [f for f in freqs if f > 0]
         avg = sum(live) / len(live) if live else 0.0
+        res = self._residency()
         if avg > 0:
             if self.min_clock == 0.0 or avg < self.min_clock:
                 self.min_clock = avg
             self.peak_clock = max(self.peak_clock, avg)
+        # the residency histogram knows the true extremes of the window: a
+        # 600 MHz floor the instant sampler missed still happened
+        if res.get("states"):
+            low = min(f for f, _share in res["states"])
+            high = max(f for f, _share in res["states"])
+            self.min_clock = low if self.min_clock == 0.0 else min(self.min_clock, low)
+            self.peak_clock = max(self.peak_clock, high)
+        # transitions: prefer the governor's own counter over a sampled guess
+        steps = res.get("transitions")
+        if steps:
+            self.dvfs_steps += steps
+        elif self._last_step_mhz and abs(avg - self._last_step_mhz) >= 1.0:
             # a governor step is a change large enough to be a real DVFS edge,
             # not float noise from the kHz → MHz conversion
-            if self._last_step_mhz and abs(avg - self._last_step_mhz) >= 1.0:
-                self.dvfs_steps += 1
+            self.dvfs_steps += 1
+        if avg > 0:
             self._last_step_mhz = avg
         lim = self._clock_limits()
         top = lim["max"] or 0.0
         return {
             "per_core_mhz": freqs,
             "mhz": avg,
+            # the time-weighted mean over the last window: the accurate one
+            "weighted_mhz": res.get("weighted_mhz") or 0.0,
+            "weighted_ready": bool(res.get("ready")),
+            "window_s": round(float(res.get("window_s") or 0.0), 3),
+            "residency": res.get("residency") or {},
+            "residency_max": res.get("residency_max") or 0.0,
+            "residency_min": res.get("residency_min") or 0.0,
+            "states": res.get("states") or [],
+            "transitions": res.get("transitions"),
+            "source": self._freq_source,
             "peak_mhz": self.peak_clock,
             "min_mhz": self.min_clock,
             "core_max_mhz": max(live) if live else 0.0,
@@ -660,14 +869,18 @@ class Collector:
             "dvfs_steps": self.dvfs_steps,
         }
 
-    def _volts_block(self, ttl: float = 1.5, rail_ttl: float = 30.0) -> dict:
+    def _volts_block(self, ttl: float | None = None, rail_ttl: float = 30.0,
+                     mhz: float = 0.0) -> dict:
         """Core rail plus the SDRAM rails, straight from the firmware mailbox.
 
-        Core voltage moves with the DVFS step, so 1.5 s is fast enough to watch
-        it work while costing one fork per sample; the SDRAM rails are fixed
-        1.1 V on a Pi 4 and only need a slow refresh.
+        Core voltage moves with the DVFS step, so the rail is re-read as often
+        as the tick rate allows (the fork costs 2-3 ms; the app sets `volt_ttl`
+        from the interval) while the SDRAM rails, fixed at 1.1 V on a Pi 4, get
+        a slow refresh. Every fresh reading is paired with the clock that was
+        live at that moment — the v/f pairs are evidence, not decoration.
         """
         now = time.monotonic()
+        ttl = self.volt_ttl if ttl is None else ttl
         if self._volts and now - self._volts_ts < ttl:
             return self._volts
         prev = self._volts.get("core")
@@ -681,12 +894,22 @@ class Collector:
         if core is not None:
             self.volt_min = core if self.volt_min is None else min(self.volt_min, core)
             self.volt_max = core if self.volt_max is None else max(self.volt_max, core)
+            rounded = round(core, 4)
+            if rounded not in self._volt_seen and len(self._volt_seen) < 64:
+                self._volt_seen.append(rounded)
+            if mhz > 0:
+                self._vf[round(mhz)] = core
+                if len(self._vf) > 64:
+                    for stale in list(self._vf)[:32]:
+                        self._vf.pop(stale, None)
         self._volts = {
             "core": core,
             "rails": dict(self._rails),
             "delta": (core - prev) if (core is not None and prev is not None) else 0.0,
             "min": self.volt_min,
             "max": self.volt_max,
+            "vf": dict(sorted(self._vf.items())),
+            "step_mv": volt_step_mv(self._volt_seen),
         }
         self._volts_ts = now
         return self._volts
@@ -739,7 +962,7 @@ class Collector:
         the ARM clock and the latched UV alarm — are read on every tick.
         """
         clock = clock or self._clock_block()
-        volt = self._volts_block()
+        volt = self._volts_block(mhz=clock["mhz"])
         thr = self._throttle_block()
         clocks = dict(self._fw_clocks())
         if clock["mhz"]:
@@ -756,6 +979,10 @@ class Collector:
             "volts_delta": volt["delta"],
             "volts_min": volt["min"],
             "volts_max": volt["max"],
+            # observed v/f pairs + the regulator's step: the accuracy evidence
+            "vf": volt.get("vf") or {},
+            "vf_pairs": len(volt.get("vf") or {}),
+            "volt_step_mv": volt.get("step_mv"),
             "governor": clock["governor"],
         }
         return self._pi_cache
@@ -1101,10 +1328,36 @@ class Collector:
 # --------------------------------------------------------------------------- #
 # renderers — pure (snapshot, width) -> rich Text; shared by TUI and --once
 # --------------------------------------------------------------------------- #
+def _core_cell(i: int, pct_core: float, mhz_now: float, bar_w: int, cell_w: int) -> Text:
+    """One core in one line, sized to `cell_w`.
+
+    A half-width cell in a 3-column layout is ~16 cells: not enough for a load
+    bar *and* a load percentage *and* a clock. The bar is the first thing to go
+    — the percentage says the same thing, the clock says something new.
+    """
+    style = usage_style(pct_core)
+    cell = Text()
+    cell.append(f"cpu{i} ", style=C_LABEL)
+    if bar_w > 0:
+        cell.append_text(bar(pct_core, bar_w, style))
+    if cell_w >= 21:
+        cell.append(f"{pct_core:5.1f}%", style=style)
+        if mhz_now:
+            cell.append(f" {mhz_now / 1000:.2f}G", style=C_DIM)
+    else:
+        cell.append(f"{pct_core:3.0f}%", style=style)
+        if mhz_now and cell_w >= 15:
+            cell.append(f" {mhz_now / 1000:.1f}G", style=C_DIM)
+    cell.truncate(cell_w)
+    return cell
+
+
 def render_cpu(s: dict, width: int = 46, height: int | None = None) -> Text:
     t = Text()
     bw = max(8, min(12, width - 20))
-    load, gov = s["load"], s["pi"].get("governor") or "n/a"
+    load = s["load"]
+    pi = s.get("pi") or {}
+    gov = pi.get("governor") or "n/a"
     ck = s.get("clock") or {}
     mhz = ck.get("mhz") or s.get("freq") or 0.0
     pct = ck.get("pct_of_max") or 0.0
@@ -1115,11 +1368,11 @@ def render_cpu(s: dict, width: int = 46, height: int | None = None) -> Text:
         t.append(f"  {gov}", style=C_DIM)
     t.append("\n")
 
-    # the ARM clock comes from sysfs every tick, so this line is real-time
+    # clk: the governor's *requested* clock, read from cpufreq every tick
     # (the firmware's own number is a 2-3 ms fork and only used as a fallback)
-    t.append("clock  ", style=C_LABEL)
+    t.append("clk   ", style=C_LABEL)
     if mhz:
-        t.append(f"{mhz/1000:.3f}GHz", style=C_ACCENT)
+        t.append(f"{mhz / 1000:.3f}GHz", style=C_ACCENT)
         t.append(f" {pct:3.0f}%", style=C_DIM if pct < 99.5 else C_ACCENT)
         spark_w = width - 22
         if spark_w >= 8:
@@ -1129,6 +1382,44 @@ def render_cpu(s: dict, width: int = 46, height: int | None = None) -> Text:
                 lo=ck.get("limit_min_mhz") or 0.0,
                 hi=ck.get("limit_max_mhz") or 0.0,
             ))
+    else:
+        t.append("n/a", style=C_DIM)
+    t.append("\n")
+
+    # avg: the *measured* clock — time-weighted over the sample window from
+    # cpufreq's time_in_state counters. One instant per tick can miss a DVFS
+    # excursion entirely (ondemand often runs a whole second at 600 MHz and is
+    # sampled at 1.8 GHz, or the reverse), so this is the number to trust.
+    t.append("avg   ", style=C_LABEL)
+    weighted = ck.get("weighted_mhz") or 0.0
+    if ck.get("weighted_ready") and weighted:
+        t.append(f"{weighted / 1000:.3f}GHz", style=C_VAL)
+        if width >= 30:
+            t.append(f" {ck.get('residency_max') or 0:3.0f}%@max", style=C_DIM)
+        steps = ck.get("transitions")
+        if width >= 36 and steps is not None:
+            t.append(f" {steps} st", style=C_DIM)
+    elif mhz:
+        t.append(f"{mhz / 1000:.3f}GHz", style=C_DIM)
+        t.append(" inst", style=C_DIM)
+    else:
+        t.append("n/a", style=C_DIM)
+    t.append("\n")
+
+    # volt: the core rail at 4 decimals. The firmware quantises it in 25 mV
+    # steps, so rounding to 3 hides exactly the step you are trying to watch.
+    volts = pi.get("volts")
+    t.append("volt  ", style=C_LABEL)
+    if volts:
+        t.append(f"{volts:.4f}V", style=C_VAL)
+        delta = pi.get("volts_delta") or 0.0
+        if abs(delta) >= 0.0005:
+            t.append("▲" if delta > 0 else "▼", style=C_ACCENT if delta > 0 else C_WARN)
+        vmin, vmax = pi.get("volts_min"), pi.get("volts_max")
+        if width >= 32 and vmin and vmax:
+            t.append(f" {vmin:.4f}–{vmax:.4f}", style=C_DIM)
+        if width >= 40 and mhz:
+            t.append(f" @{mhz / 1000:.2f}G", style=C_DIM)
     else:
         t.append("n/a", style=C_DIM)
     t.append("\n")
@@ -1143,20 +1434,145 @@ def render_cpu(s: dict, width: int = 46, height: int | None = None) -> Text:
     t.append("\n")
 
     cores = s["per_core"]
-    # three header lines + one line per core; keep the "+N more" note visible
-    room = len(cores) if height is None else max(1, height - 3)
-    if len(cores) > room:
-        room = max(1, room - 1)
-    for i, pct_core in enumerate(cores[:room]):
-        c = usage_style(pct_core)
-        f = s["core_freqs"][i] if i < len(s["core_freqs"]) else 0
-        t.append(f"cpu{i:<2}  ", style=C_LABEL)
-        t.append_text(bar(pct_core, bw, c))
-        t.append(f" {pct_core:5.1f}%", style=c)
-        t.append(f" {f/1000:4.2f}G\n" if f else "\n", style=C_DIM)
-    if len(cores) > room:
-        t.append(f"… {len(cores) - room} more cores\n", style=C_DIM)
+    freqs = s.get("core_freqs") or []
+    # Two cores per line whenever a half-width cell can still hold a bar, a
+    # load and a clock (a 3-column layout gives the panel only ~32 cells, and
+    # four cores one-up would push two of them out of the band). `height` is
+    # the panel's content height, so the five header lines are accounted for.
+    two_up = width >= 28
+    cell_w = (width - 2) // 2 if two_up else width
+    if two_up:
+        # "cpu0 " + bar + " 19.4%" + " 1.80G" (or the compact " 19%" + " 1.8G")
+        fixed = 17 if cell_w >= 21 else 14
+        bar_w = max(0, min(8, cell_w - fixed)) if cell_w >= 18 else 0
+    else:
+        bar_w = bw
+    per_line = 2 if two_up else 1
+    room = None if height is None else max(1, height - 5)     # 5 header lines
+    if room is None:
+        max_cores = len(cores)
+    else:
+        max_cores = room * per_line
+        if len(cores) > max_cores:
+            # keep a line for the "… N more cores" note rather than clip silently
+            max_cores = max(per_line, (room - 1) * per_line)
+        max_cores = min(len(cores), max_cores)
+
+    for line_start in range(0, min(len(cores), max_cores), per_line):
+        for slot in range(per_line):
+            i = line_start + slot
+            if i >= min(len(cores), max_cores):
+                break
+            f = freqs[i] if i < len(freqs) else 0
+            cell = _core_cell(i, cores[i], f, bar_w, cell_w)
+            if slot:
+                t.append("  ")
+            t.append_text(pad(cell, cell_w) if two_up else cell)
+        t.append("\n")
+    hidden = len(cores) - min(len(cores), max_cores)
+    if hidden and (height is not None):
+        t.append(f"… {hidden} more core{'s' if hidden > 1 else ''}\n", style=C_DIM)
     return t
+
+
+def render_cpu_detail(s: dict, col: Collector, width: int = 76) -> Text:
+    """Everything the CPU panel cannot fit, with the evidence for each number."""
+    ck = s.get("clock") or {}
+    pi = s.get("pi") or {}
+    t = Text()
+
+    t.append("requested  ", style=C_LABEL)
+    if ck.get("mhz"):
+        t.append(f"{ck['mhz'] / 1000:.3f} GHz", style=C_ACCENT)
+        t.append(f"  {ck.get('pct_of_max') or 0:3.0f}% of max", style=C_DIM)
+        t.append(f"  from {ck.get('source') or 'n/a'}", style=C_DIM)
+    else:
+        t.append("n/a", style=C_DIM)
+    t.append("\n")
+
+    t.append("measured   ", style=C_LABEL)
+    if ck.get("weighted_ready") and ck.get("weighted_mhz"):
+        t.append(f"{ck['weighted_mhz'] / 1000:.3f} GHz", style=C_OK)
+        t.append(f"  weighted {ck.get('window_s') or 0:.2f} s"
+                 f" · {ck.get('residency_max') or 0:.0f}% max"
+                 f" · {ck.get('residency_min') or 0:.0f}% min", style=C_DIM)
+    else:
+        t.append("waiting for a second sample (cpufreq time_in_state)", style=C_DIM)
+    t.append("\n")
+
+    t.append("limits     ", style=C_LABEL)
+    t.append(f"{ck.get('limit_min_mhz') or 0:.0f}–{ck.get('limit_max_mhz') or 0:.0f} MHz",
+             style=C_VAL)
+    t.append(f" · {ck.get('governor') or 'n/a'}"
+             f" · {ck.get('dvfs_steps') or 0} transitions this session", style=C_DIM)
+    t.append("\n")
+
+    fw = (pi.get("clocks") or {}).get("arm")
+    t.append("firmware   ", style=C_LABEL)
+    if fw and ck.get("mhz"):
+        delta = fw / 1e6 - ck["mhz"]
+        t.append(f"arm {fw / 1e6:.2f} MHz", style=C_VAL)
+        t.append(f"  vs sysfs {ck['mhz']:.0f} MHz  (Δ {delta:+.2f} MHz)", style=C_DIM)
+        t.append("\n           two sources for one number: a large Δ means the"
+                 "\n           governor request has not taken effect yet", style=C_DIM)
+    else:
+        t.append("n/a (no vcgencmd / cpufreq)", style=C_DIM)
+    t.append("\n\n")
+
+    t.append("CORE   LOAD                CLOCK\n", style=C_TITLE)
+    freqs = s.get("core_freqs") or []
+    for i, pct_core in enumerate(s["per_core"]):
+        f = freqs[i] if i < len(freqs) else 0.0
+        style = usage_style(pct_core)
+        t.append(f"cpu{i:<2}  ", style=C_LABEL)
+        t.append_text(bar(pct_core, 10, style))
+        t.append(f" {pct_core:5.1f}%", style=style)
+        t.append(f"   {f:6.0f} MHz", style=C_VAL if f else C_DIM)
+        if not f:
+            t.append("  offline?", style=C_DIM)
+        t.append("\n")
+
+    states = ck.get("states") or []
+    t.append("\nRESIDENCY (last window)\n", style=C_TITLE)
+    bar_w = max(10, min(26, width - 30))
+    if states:
+        for state_mhz, share in states[:7]:
+            t.append(f"{state_mhz:7.0f} MHz ", style=C_LABEL)
+            t.append_text(bar(share, bar_w, C_ACCENT))
+            t.append(f" {share:5.1f}%\n", style=C_VAL)
+        if len(states) > 7:
+            t.append(f"         … {len(states) - 7} more states\n", style=C_DIM)
+    else:
+        t.append("  no cpufreq stats exposed by this kernel\n", style=C_DIM)
+
+    t.append("\nCORE RAIL\n", style=C_TITLE)
+    volts = pi.get("volts")
+    if volts:
+        t.append(f"  now    {volts:.4f} V", style=C_VAL)
+        vmin, vmax = pi.get("volts_min"), pi.get("volts_max")
+        if vmin and vmax:
+            t.append(f"   seen {vmin:.4f}–{vmax:.4f} V", style=C_DIM)
+        step = pi.get("volt_step_mv")
+        if step:
+            t.append(f"   step {step:g} mV", style=C_DIM)
+        t.append("\n")
+        vf = pi.get("vf") or {}
+        if vf:
+            t.append("  v/f    ", style=C_LABEL)
+            t.append("  ".join(f"{m / 1000:.2f}G@{v:.4f}V" for m, v in sorted(vf.items())),
+                     style=C_VAL)
+            t.append("\n")
+        else:
+            t.append("  v/f    no pair sampled yet\n", style=C_DIM)
+        rails = pi.get("rails") or {}
+        if rails:
+            t.append("  rails  ", style=C_LABEL)
+            t.append("  ".join(f"{k} {v:.3f}V" for k, v in sorted(rails.items())),
+                     style=C_DIM)
+            t.append("\n")
+    else:
+        t.append("  n/a (no vcgencmd on this machine)\n", style=C_DIM)
+    return fit(t, width)
 
 
 def render_mem(s: dict, width: int = 46) -> Text:
@@ -1382,7 +1798,7 @@ def render_hist(s: dict, c: Collector, width: int = 46) -> Text:
     t.append_text(sparkline(s.get("volt_hist") or c.volt_hist, w, C_WARN,
                             lo=0.75, hi=1.15))
     volts = s.get("pi", {}).get("volts")
-    t.append(f" {volts:5.3f}V\n" if volts else "  n/a\n", style=C_WARN)
+    t.append(f" {volts:6.4f}V\n" if volts else "  n/a\n", style=C_WARN)
     t.append("load  ", style=C_LABEL)
     t.append_text(sparkline(c.load_hist, w, C_OK))
     t.append(f" {s['load'][0]:4.2f}\n", style=C_OK)
@@ -1588,6 +2004,40 @@ Confirm { align: center middle; background: $background 75%; }
 #dialog.danger #dlg_title { color: $text-error; }
 #dlg_body { color: $foreground; padding: 1 0 0 0; }
 #dlg_keys { color: $foreground-muted; padding: 1 0 0 0; }
+
+/* theme picker — docked right, screen left transparent: the dashboard stays
+   visible and repaints in the previewed theme as the cursor moves */
+ThemePicker { align: right middle; background: transparent; }
+#picker {
+    width: 46;
+    max-width: 80%;
+    height: auto;
+    max-height: 100%;
+    border: round $text-primary;
+    background: $panel;
+    padding: 1 2;
+}
+#pick_title { color: $text-primary; text-style: bold; }
+#pick_search { color: $foreground-muted; height: auto; }
+#pick_list { color: $foreground; height: auto; }
+#pick_swatch { height: auto; padding: 1 0 0 0; }
+#pick_keys { color: $foreground-muted; padding: 1 0 0 0; }
+
+/* CPU detail — every number the panel cannot fit, repainted each sample */
+CpuDetail { align: center middle; background: $background 82%; }
+#detail {
+    width: 74;
+    max-width: 96%;
+    height: auto;
+    max-height: 94%;
+    border: round $text-primary;
+    background: $panel;
+    padding: 1 2;
+}
+#detail_title { color: $text-primary; text-style: bold; }
+#detail_scroll { height: auto; max-height: 1fr; scrollbar-size: 1 1; }
+#detail_body { color: $foreground; height: auto; }
+#detail_keys { color: $foreground-muted; padding: 1 0 0 0; }
 """
 
 
@@ -1642,6 +2092,182 @@ class Confirm(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class ThemePicker(ModalScreen[str | None]):
+    """Theme list with a live preview of the dashboard behind it.
+
+    Moving the highlight applies the theme immediately — the border, the panels
+    and the hand-drawn Rich text all repaint in the candidate colours before you
+    commit, which is the whole point: a theme you have not seen applied is a
+    colour name, not a choice. Enter keeps and remembers it, Escape restores the
+    one you arrived with.
+
+    Every key is handled here (and stopped) because app bindings must not fire
+    while the list has focus: `q` in a theme picker has to filter, not quit.
+    """
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("up", "move('-1')", "Up", show=False),
+        Binding("down", "move('1')", "Down", show=False),
+        Binding("pageup", "move('-6')", "Page up", show=False),
+        Binding("pagedown", "move('6')", "Page down", show=False),
+        Binding("home", "first", "Top", show=False),
+        Binding("end", "last", "Bottom", show=False),
+        Binding("enter", "keep", "Preview"),
+        Binding("escape", "cancel", "Back"),
+    ]
+
+    def __init__(self, original: str):
+        super().__init__()
+        self.original = original
+        self.needle = ""
+        self.names = theme_names()
+        self.index = self.names.index(original) if original in self.names else 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker"):
+            yield Static("THEME · live preview", id="pick_title")
+            yield Static("", id="pick_search", markup=False)
+            yield Static("", id="pick_list", markup=False)
+            yield Static("", id="pick_swatch", markup=False)
+            yield Static("↑↓ browse · enter keep · esc back · type to search",
+                         id="pick_keys", markup=False)
+
+    def on_mount(self) -> None:
+        self._refresh()
+
+    # -- list ------------------------------------------------------------- #
+    def _visible(self) -> list[str]:
+        if not self.needle:
+            return self.names
+        return [n for n in self.names if self.needle in n.lower()]
+
+    def _current(self) -> str | None:
+        names = self._visible()
+        if not names:
+            return None
+        self.index = max(0, min(self.index, len(names) - 1))
+        return names[self.index]
+
+    def _refresh(self) -> None:
+        names = self._visible()
+        search = self.query_one("#pick_search", Static)
+        search.update(f"search: {self.needle}  ({len(names)} themes)" if self.needle else "")
+        body = Text()
+        if not names:
+            body.append("no theme matches that filter", style=C_DIM)
+        else:
+            current = self._current() or names[0]
+            rows = max(5, min(len(names), self.app.size.height - 15))
+            start = max(0, min(self.index - rows // 2, len(names) - rows))
+            for i in range(start, min(len(names), start + rows)):
+                name = names[i]
+                selected = i == self.index
+                body.append("▸ " if selected else "  ",
+                            style=C_ACCENT if selected else C_DIM)
+                body.append(name, style=f"bold {C_ACCENT}" if selected else C_VAL)
+                if name == self.original:
+                    body.append("  ← current", style=C_DIM)
+                body.append("\n")
+            if len(names) > rows:
+                body.append(f"  … {len(names)} themes · {start + 1}–"
+                            f"{min(len(names), start + rows)}\n", style=C_DIM)
+        self.query_one("#pick_list", Static).update(body)
+        current = self._current()
+        swatch = self.query_one("#pick_swatch", Static)
+        if current is None:
+            swatch.update("")
+            return
+        swatch.update(theme_swatch(current))
+        app = self.app
+        if isinstance(app, PistatApp):
+            app.preview_theme(current)          # live preview, not yet saved
+
+    # -- actions ---------------------------------------------------------- #
+    def action_move(self, delta: str) -> None:
+        step = int(delta)
+        names = self._visible()
+        if not names:
+            return
+        self.index = max(0, min(self.index + step, len(names) - 1))
+        self._refresh()
+
+    def action_first(self) -> None:
+        self.index = 0
+        self._refresh()
+
+    def action_last(self) -> None:
+        self.index = max(0, len(self._visible()) - 1)
+        self._refresh()
+
+    def action_keep(self) -> None:
+        name = self._current()
+        if name is None:
+            self.dismiss(None)
+            return
+        app = self.app
+        if isinstance(app, PistatApp):
+            app.keep_theme(name)
+        self.dismiss(name)
+
+    def action_cancel(self) -> None:
+        app = self.app
+        if isinstance(app, PistatApp):
+            app.restore_theme(self.original)
+        self.dismiss(None)
+
+    def on_key(self, event: events.Key) -> None:
+        """Printable keys filter the list; they must never reach app bindings."""
+        ch = event.character
+        if event.key in ("backspace", "delete"):
+            self.needle = self.needle[:-1]
+            self.index = 0
+            self._refresh()
+            event.stop()
+            event.prevent_default()
+        elif ch and ch.isprintable() and not ch.isspace():
+            self.needle += ch.lower()
+            self.index = 0
+            self._refresh()
+            event.stop()
+            event.prevent_default()
+
+
+class CpuDetail(ModalScreen[None]):
+    """Full-screen CPU view: the numbers the panel has no room to prove.
+
+    Per-core clocks, the requested/measured/firmware three-way comparison, the
+    time-in-state histogram and the observed v/f pairs. It re-renders on every
+    sample while it is open.
+    """
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "close", "Close"),
+        Binding("c", "close", "Close"),
+        Binding("q", "close", "Close", show=False),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="detail"):
+            yield Static("CPU DETAIL", id="detail_title")
+            with VerticalScroll(id="detail_scroll"):
+                yield Static("waiting for the first sample…", id="detail_body", markup=False)
+            yield Static("esc close · live: repainted every sample",
+                         id="detail_keys", markup=False)
+
+    def on_mount(self) -> None:
+        app = self.app
+        if isinstance(app, PistatApp) and app.last is not None:
+            self.refresh_from(app.last, app.collector)
+
+    def refresh_from(self, s: dict, col: Collector) -> None:
+        body_widget = self.query_one("#detail_body", Static)
+        width = body_widget.content_size.width or 72
+        body_widget.update(fit(render_cpu_detail(s, col, width), width))
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class PistatApp(App):
     CSS = CSS
     TITLE = "pistat"
@@ -1657,6 +2283,8 @@ class PistatApp(App):
         Binding("5", "interval('5')", "5s", show=False),
         Binding("r", "reset_peaks", "Reset", show=False),
         Binding("slash", "focus_filter", "Filter"),
+        Binding("t", "themes", "Theme"),
+        Binding("c", "cpu_detail", "CPU"),
         Binding("up", "move('-1')", "Up", show=False),
         Binding("down", "move('1')", "Down", show=False),
         Binding("k", "move('-1')", "Up", show=False),
@@ -1700,9 +2328,17 @@ class PistatApp(App):
         self.offset = 0
         self._rows: list[dict] = []
         self._view_h = 10
+        # a theme preview must not be persisted: only a confirmed choice is.
+        # watch_theme() is the save hook, so it needs to know the difference.
+        self._previewing = False
         # our slate theme, and let the command palette switch to any other
         self.register_theme(PISTAT_THEME)
+        self._sync_volt_ttl()
         self.theme = self._initial_theme(theme)
+
+    def _sync_volt_ttl(self) -> None:
+        """Read the core rail as often as the tick rate allows (fork: 2-3 ms)."""
+        self.collector.volt_ttl = max(0.2, self.interval * 0.9)
 
     def _initial_theme(self, requested: str | None) -> str:
         """Pick the startup theme: explicit flag > saved preference > slate.
@@ -1754,10 +2390,19 @@ class PistatApp(App):
 
         Textual restyles the chrome itself (the CSS uses theme variables); this
         keeps the hand-drawn Rich text in step, then forces a full repaint.
+
+        A preview from the theme picker comes through here too — the whole point
+        of a preview is to see it painted, not to remember it — so the save (and
+        the toast) only happen for a real choice.
         """
         try:
             apply_palette(palette_from_theme(self.get_theme(theme_name)))
         except Exception:                 # noqa: BLE001 — never break a theme switch
+            return
+        if self._previewing:
+            self._panel_cache.clear()
+            if self.last is not None and self.is_mounted:
+                self.render_all(self.last)
             return
         save_config(theme=theme_name)     # remember it for the next run
         self._panel_cache.clear()
@@ -1765,6 +2410,33 @@ class PistatApp(App):
             self.render_all(self.last)
         if self.is_mounted:
             self.notify(f"theme: {theme_name}", timeout=1.5)
+
+    # -- theme preview (t) ------------------------------------------------ #
+    def preview_theme(self, name: str) -> None:
+        """Apply `name` for a look, without saving it."""
+        if name not in self.available_themes:
+            return
+        self._previewing = True
+        self.theme = name
+
+    def keep_theme(self, name: str) -> None:
+        """Confirm the previewed theme and remember it."""
+        self._previewing = False
+        if name in self.available_themes:
+            self.theme = name
+        save_config(theme=name)
+
+    def restore_theme(self, name: str) -> None:
+        """Put the pre-preview theme back (escape from the picker)."""
+        self._previewing = False
+        if name in self.available_themes:
+            self.theme = name
+
+    def action_themes(self) -> None:
+        self.push_screen(ThemePicker(self.theme))
+
+    def action_cpu_detail(self) -> None:
+        self.push_screen(CpuDetail())
 
     def _start_timer(self) -> None:
         if self._timer is not None:
@@ -1808,6 +2480,7 @@ class PistatApp(App):
     # -- actions ---------------------------------------------------------- #
     def action_interval(self, seconds: str) -> None:
         self.interval = float(seconds)
+        self._sync_volt_ttl()
         self._start_timer()
         self.notify(f"sample interval → {self.interval:g}s", timeout=1.5)
         if self.last:
@@ -1943,6 +2616,9 @@ class PistatApp(App):
             return
         self.last = snap
         self.render_all(snap)
+        # a modal CPU view is live: it shows the sample that just arrived
+        if isinstance(self.screen, CpuDetail):
+            self.screen.refresh_from(snap, self.collector)
 
     # -- painting --------------------------------------------------------- #
     def _width(self, panel_id: str, fallback: int) -> int:
@@ -2100,6 +2776,15 @@ def _clock_json(ck: dict) -> dict:
         "limit_max_mhz": mhz("limit_max_mhz"),
         "pct_of_max": round(float(ck.get("pct_of_max") or 0.0), 1),
         "dvfs_steps": int(ck.get("dvfs_steps") or 0),
+        # measured clock: time-weighted over the sample window, plus the share
+        # of that window spent at the top DVFS state and the transitions seen
+        "weighted_mhz": mhz("weighted_mhz"),
+        "weighted_ready": bool(ck.get("weighted_ready")),
+        "window_s": round(float(ck.get("window_s") or 0.0), 2),
+        "residency_max_pct": round(float(ck.get("residency_max") or 0.0), 1),
+        "residency_min_pct": round(float(ck.get("residency_min") or 0.0), 1),
+        "transitions": ck.get("transitions"),
+        "source": ck.get("source") or None,
         "governor": ck.get("governor") or None,
     }
 
@@ -2112,6 +2797,10 @@ def _power_json(s: dict) -> dict:
         "core_volts": pi.get("volts"),
         "core_volts_min": pi.get("volts_min"),
         "core_volts_max": pi.get("volts_max"),
+        "core_volts_step_mv": pi.get("volt_step_mv"),
+        # {clock_mhz: volts} pairs actually observed together
+        "vf_pairs": {str(int(k)): round(float(v), 4)
+                     for k, v in (pi.get("vf") or {}).items()},
         "rails_volts": {k: round(v, 4) for k, v in sorted(rails.items())},
         "throttled_hex": pi.get("throttle_raw"),
         "throttle_now": pi.get("throttle_now") or [],
@@ -2253,7 +2942,8 @@ def main(argv: list[str] | None = None) -> int:
         prog="pistat",
         description="pistat — real-time TUI system dashboard (Raspberry Pi friendly)",
         epilog="Keys in the TUI: q quit · p pause · s sort · S reverse · 1/2/5 interval "
-               "· r reset peaks · / filter · j/k move · PgUp/PgDn · Home/End",
+               "· r reset peaks · / filter · t themes (live preview) · c CPU detail "
+               "· j/k move · PgUp/PgDn · Home/End",
     )
     ap.add_argument("-i", "--interval", type=float, default=1.0,
                     help=f"sampling interval in seconds (default 1.0, minimum {MIN_INTERVAL:.1f})")
@@ -2268,15 +2958,33 @@ def main(argv: list[str] | None = None) -> int:
                          "in the TUI: ^p → Change theme)")
     ap.add_argument("--themes", action="store_true",
                     help="list the available theme names and exit")
+    ap.add_argument("--swatch", metavar="NAME", default=None,
+                    help="paint a theme's colours and exit ('--swatch all' for every "
+                         "theme); works without a tty, so it is how you check a theme "
+                         "palette over ssh or in a CI job")
     ap.add_argument("-V", "--version", action="version", version=f"pistat {__version__}")
     args = ap.parse_args(argv)
 
-    known_themes = ["pistat", *sorted(BUILTIN_THEMES)]
+    known_themes = theme_names()
     if args.themes:
         saved = load_config().get("theme") or DEFAULT_THEME
         for name in known_themes:
             print(f"{'*' if name == saved else ' '} {name}")
-        print("\n(* = remembered; choose with pistat --theme NAME or ^p in the TUI)")
+        print("\n(* = remembered; choose with pistat --theme NAME, `t` in the TUI,"
+              " or preview first with: pistat --swatch NAME)")
+        return 0
+    if args.swatch is not None:
+        from rich.console import Console
+
+        console = Console(width=term_width(args.width), no_color=NO_COLOR)
+        chosen = known_themes if args.swatch == "all" else [args.swatch]
+        for name in chosen:
+            if name not in known_themes:
+                ap.error(f"unknown theme {name!r} — run 'pistat --themes' for the list")
+            mark = "*" if name == (load_config().get("theme") or DEFAULT_THEME) else " "
+            console.print(Text(f"{mark} {name}", style="bold"))
+            console.print(theme_swatch(name, term_width(args.width) - 4))
+            console.print()
         return 0
     if args.theme is not None and args.theme not in known_themes:
         ap.error(f"unknown theme {args.theme!r} — run 'pistat --themes' for the list")
